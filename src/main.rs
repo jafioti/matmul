@@ -139,7 +139,7 @@ fn run(
     shader: &ComputePipelineState,
     dev: &Device,
     mat_size: usize,
-) -> Option<(Vec<f32>, f32)> {
+) -> Option<(Vec<f32>, f32, f32)> {
     autoreleasepool(|| {
         let mut cpu_start = 0;
         let mut gpu_start = 0;
@@ -177,7 +177,7 @@ fn run(
         let thread_block_size = 32;
         encoder.set_threadgroup_memory_length(
             0,
-            thread_block_size * thread_block_size * 2 * 2 * std::mem::size_of::<f32>() as u64,
+            thread_block_size * thread_block_size * std::mem::size_of::<f32>() as u64,
         );
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -193,8 +193,10 @@ fn run(
         );
         encoder.end_encoding();
         resolve_samples_into_buffer(command_buffer, &counter_sample_buffer, &destination_buffer);
+        let now = std::time::Instant::now();
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        let millis = now.elapsed().as_millis();
         let mut cpu_end = 0;
         let mut gpu_end = 0;
         dev.sample_timestamps(&mut cpu_end, &mut gpu_end);
@@ -202,6 +204,7 @@ fn run(
             MTLCommandBufferStatus::Completed => Some((
                 copy_from_buffer(&c_buffer),
                 handle_timestamps(&destination_buffer, cpu_start, cpu_end, gpu_start, gpu_end),
+                millis as f32,
             )),
             _ => None,
         }
@@ -227,14 +230,16 @@ fn main() {
         let shader = compile_function("matmul", NAIEVE_SHADER, &dev);
         let mut data: Option<Vec<f32>> = None;
         let mut successes = 0;
-        let mut total_time = 0.0;
+        let mut total_gpu_time = 0.0;
+        let mut total_cpu_time = 0.0;
         for _ in 0..iters {
             let curr_data = run(&a_buffer, &b_buffer, &shader, &dev, mat_size);
-            if let Some((curr_data, time)) = curr_data {
+            if let Some((curr_data, gpu_time, cpu_time)) = curr_data {
+                successes += 1;
+                total_gpu_time += gpu_time;
+                total_cpu_time += cpu_time;
                 match &mut data {
                     Some(d) => {
-                        successes += 1;
-                        total_time += time;
                         for (i, (a, b)) in d.iter().zip(curr_data.iter()).enumerate() {
                             if (*a - *b).abs() > 1e-5 {
                                 println!("Index {i} A: {a} B: {b}");
@@ -247,18 +252,24 @@ fn main() {
                 }
             }
         }
-        println!("Naieve Time: {}ms", total_time / successes as f32);
+        println!(
+            "Naive    CPU: {}ms GPU: {}ms",
+            total_cpu_time / successes as f32,
+            total_gpu_time / successes as f32
+        );
 
         let shader = compile_function("tiled_matmul", TILED_SHADER, &dev);
         let mut successes = 0;
-        let mut total_time = 0.0;
+        let mut total_gpu_time = 0.0;
+        let mut total_cpu_time = 0.0;
         for _ in 0..iters {
             let curr_data = run(&a_buffer, &b_buffer, &shader, &dev, mat_size);
-            if let Some((curr_data, time)) = curr_data {
+            if let Some((curr_data, gpu_time, cpu_time)) = curr_data {
+                successes += 1;
+                total_gpu_time += gpu_time;
+                total_cpu_time += cpu_time;
                 match &mut data {
                     Some(d) => {
-                        successes += 1;
-                        total_time += time;
                         for (i, (a, b)) in d.iter().zip(curr_data.iter()).enumerate() {
                             if (*a - *b).abs() > 1e-5 {
                                 println!("Index {i} A: {a} B: {b}");
@@ -272,18 +283,24 @@ fn main() {
             }
         }
 
-        println!("Tiled Time: {}ms", total_time / successes as f32);
+        println!(
+            "Tiled    CPU: {}ms GPU: {}ms",
+            total_cpu_time / successes as f32,
+            total_gpu_time / successes as f32
+        );
 
         let shader = compile_function("prefetch_matmul", PREFETCH_SHADER, &dev);
         let mut successes = 0;
-        let mut total_time = 0.0;
+        let mut total_gpu_time = 0.0;
+        let mut total_cpu_time = 0.0;
         for _ in 0..iters {
             let curr_data = run(&a_buffer, &b_buffer, &shader, &dev, mat_size);
-            if let Some((curr_data, time)) = curr_data {
+            if let Some((curr_data, gpu_time, cpu_time)) = curr_data {
+                successes += 1;
+                total_gpu_time += gpu_time;
+                total_cpu_time += cpu_time;
                 match &mut data {
                     Some(d) => {
-                        successes += 1;
-                        total_time += time;
                         for (i, (a, b)) in d.iter().zip(curr_data.iter()).enumerate() {
                             if (*a - *b).abs() > 1e-5 {
                                 println!("Index {i} A: {a} B: {b}");
@@ -297,7 +314,11 @@ fn main() {
             }
         }
 
-        println!("Prefetch Time: {}ms", total_time / successes as f32);
+        println!(
+            "Prefetch CPU: {}ms GPU: {}ms",
+            total_cpu_time / successes as f32,
+            total_gpu_time / successes as f32
+        );
     })
 }
 
