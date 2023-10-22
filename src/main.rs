@@ -1,26 +1,89 @@
-use std::ffi::c_void;
-
 use metal::{
-    objc::rc::autoreleasepool, Buffer, CompileOptions, ComputePassDescriptor,
-    ComputePipelineDescriptor, ComputePipelineState, Device, FunctionConstantValues, MTLDataType,
-    MTLResourceOptions, MTLSize,
+    objc::rc::autoreleasepool, Buffer, BufferRef, CommandBufferRef, CompileOptions,
+    ComputeCommandEncoderRef, ComputePassDescriptor, ComputePassDescriptorRef,
+    ComputePipelineDescriptor, ComputePipelineState, CounterSampleBuffer, CounterSampleBufferRef,
+    Device, MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSRange,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-fn run_tiled_prefetch(
-    a: &Buffer,
-    b: &Buffer,
-    m: usize,
-    n: usize,
-    k: usize,
-    dev: &Device,
-) -> (Vec<f32>, f32) {
-    autoreleasepool(|| {
-        let shader = "
+const NUM_SAMPLES: u64 = 20;
+
+const NAIEVE_SHADER: &str = "
 #include <metal_stdlib>
 using namespace metal;
 
 kernel void matmul(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    device uint& M [[buffer(3)]],
+    device uint& N [[buffer(4)]],
+    device uint& K [[buffer(5)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    if(tid.y < M && tid.x < N) {
+        float value = 0.0f;
+        for(int i = 0; i < K; ++i) {
+            value = fma(A[tid.y * K + i], B[i * N + tid.x], value);
+        }
+        C[tid.y * N + tid.x] = value;
+    }
+}";
+
+const TILED_SHADER: &str = "
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void tiled_matmul(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    device uint& M [[buffer(3)]],
+    device uint& N [[buffer(4)]],
+    device uint& K [[buffer(5)]],
+    threadgroup float* shared_memory [[threadgroup(0)]],
+    uint3 global_pos [[thread_position_in_grid]],
+    uint3 local_pos [[thread_position_in_threadgroup]],
+    uint3 block_pos [[threadgroup_position_in_grid]],
+    uint3 block_size[[threads_per_threadgroup]]
+) {
+    int row = block_pos.y * block_size.y + local_pos.y;
+    int col = block_pos.x * block_size.x + local_pos.x;
+
+    float sum = 0.0f;
+
+    for (int m = 0; m < (K + block_size.x - 1) / block_size.x; ++m) {
+        if (m * block_size.x + local_pos.x < K && row < M) {
+            shared_memory[local_pos.y * block_size.x + local_pos.x] = A[row * K + m * block_size.x + local_pos.x];
+        } else {
+            shared_memory[local_pos.y * block_size.x + local_pos.x] = 0.0f;
+        }
+
+        if (m * block_size.y + local_pos.y < K && col < N) {
+            shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = B[(m * block_size.y + local_pos.y) * N + col];
+        } else {
+            shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int e = 0; e < block_size.x; ++e) {
+            sum = fma(shared_memory[local_pos.y * block_size.x + e], shared_memory[(block_size.y + e) * block_size.x + local_pos.x], sum);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}";
+
+const PREFETCH_SHADER: &str = "
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void prefetch_matmul(
     device float *A [[buffer(0)]],
     device float *B [[buffer(1)]],
     device float *C [[buffer(2)]],
@@ -37,46 +100,44 @@ kernel void matmul(
     int ty = local_pos.y;
     int bx = block_pos.x;
     int by = block_pos.y;
-    int bx_size = block_size.x;
-    int by_size = block_size.y;
 
     threadgroup float* shared_memory_0 = shared_memory;
     threadgroup float* shared_memory_1 = shared_memory + (block_size.x * block_size.y * 2);
-    int row = by * by_size + ty;
-    int col = bx * bx_size + tx;
+    int row = by * block_size.y + ty;
+    int col = bx * block_size.x + tx;
 
     float sum = 0.0f;
 
     int m = 0;
-    if (m * bx_size + tx < K && row < M) {
-        shared_memory_0[ty * bx_size + tx] = A[row * K + m * bx_size + tx];
+    if (m * block_size.x + tx < K && row < M) {
+        shared_memory_0[ty * block_size.x + tx] = A[row * K + m * block_size.x + tx];
     } else {
-        shared_memory_0[ty * bx_size + tx] = 0.0f;
+        shared_memory_0[ty * block_size.x + tx] = 0.0f;
     }
 
-    if (m * by_size + ty < K && col < N) {
-        shared_memory_0[(by_size + ty) * bx_size + tx] = B[(m * by_size + ty) * N + col];
+    if (m * block_size.y + ty < K && col < N) {
+        shared_memory_0[(block_size.y + ty) * block_size.x + tx] = B[(m * block_size.y + ty) * N + col];
     } else {
-        shared_memory_0[(by_size + ty) * bx_size + tx] = 0.0f;
+        shared_memory_0[(block_size.y + ty) * block_size.x + tx] = 0.0f;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int m = 0; m < (K + bx_size - 1) / bx_size; m++) {
-        if ((m + 1) * bx_size + tx < K && row < M) {
-            shared_memory_1[ty * bx_size + tx] = A[row * K + (m + 1) * bx_size + tx];
+    for (int m = 0; m < (K + block_size.x - 1) / block_size.x; ++m) {
+        if ((m + 1) * block_size.x + tx < K && row < M) {
+            shared_memory_1[ty * block_size.x + tx] = A[row * K + (m + 1) * block_size.x + tx];
         } else {
-            shared_memory_1[ty * bx_size + tx] = 0.0f;
+            shared_memory_1[ty * block_size.x + tx] = 0.0f;
         }
 
-        if ((m + 1) * by_size + ty < K && col < N) {
-            shared_memory_1[(by_size + ty) * bx_size + tx] = B[((m + 1) * by_size + ty) * N + col];
+        if ((m + 1) * block_size.y + ty < K && col < N) {
+            shared_memory_1[(block_size.y + ty) * block_size.x + tx] = B[((m + 1) * block_size.y + ty) * N + col];
         } else {
-            shared_memory_1[(by_size + ty) * bx_size + tx] = 0.0f;
+            shared_memory_1[(block_size.y + ty) * block_size.x + tx] = 0.0f;
         }
 
-        for (int e = 0; e < bx_size; e++) {
-            sum += shared_memory_0[ty * bx_size + e] * shared_memory_0[(by_size + e) * bx_size + tx];
+        for (int e = 0; e < block_size.x; ++e) {
+            sum = fma(shared_memory_0[ty * block_size.x + e], shared_memory_0[(block_size.y + e) * block_size.x + tx], sum);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -89,37 +150,49 @@ kernel void matmul(
     if (row < M && col < N) {
         C[row * N + col] = sum;
     }
-}
-    ";
-        let c_buffer = dev.new_buffer(
-            (m * n * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModeManaged,
-        );
-        let shader = compile_function("matmul", shader, dev, FunctionConstantValues::new());
+}";
 
+fn run(
+    a_buffer: &Buffer,
+    b_buffer: &Buffer,
+    shader: &ComputePipelineState,
+    dev: &Device,
+    mat_size: usize,
+) -> Option<(Vec<f32>, f32)> {
+    autoreleasepool(|| {
+        let mut cpu_start = 0;
+        let mut gpu_start = 0;
+        dev.sample_timestamps(&mut cpu_start, &mut gpu_start);
+
+        let counter_sample_buffer = create_counter_sample_buffer(dev);
+        let destination_buffer = dev.new_buffer(
+            (std::mem::size_of::<u64>() * NUM_SAMPLES as usize) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let c_buffer = dev.new_buffer(
+            (mat_size * mat_size * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         let command_queue = dev.new_command_queue();
         let command_buffer = command_queue.new_command_buffer();
+
+        let compute_pass_descriptor = ComputePassDescriptor::new();
+        handle_compute_pass_sample_buffer_attachment(
+            compute_pass_descriptor,
+            &counter_sample_buffer,
+        );
+
         let encoder =
-            command_buffer.compute_command_encoder_with_descriptor(ComputePassDescriptor::new());
-        encoder.set_compute_pipeline_state(&shader);
-        encoder.set_buffer(0, Some(a), 0);
-        encoder.set_buffer(1, Some(b), 0);
+            command_buffer.compute_command_encoder_with_descriptor(compute_pass_descriptor);
+
+        encoder.set_compute_pipeline_state(shader);
+        encoder.set_buffer(0, Some(a_buffer), 0);
+        encoder.set_buffer(1, Some(b_buffer), 0);
         encoder.set_buffer(2, Some(&c_buffer), 0);
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<u32>() as u64,
-            &(m as u32) as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<u32>() as u64,
-            &(n as u32) as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &(k as u32) as *const u32 as *const _,
-        );
+        set_input_u32(encoder, 3, mat_size as u64);
+        set_input_u32(encoder, 4, mat_size as u64);
+        set_input_u32(encoder, 5, mat_size as u64);
         let thread_block_size = 32;
         encoder.set_threadgroup_memory_length(
             0,
@@ -127,8 +200,8 @@ kernel void matmul(
         );
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: (m as u64 + thread_block_size - 1) / thread_block_size,
-                height: (n as u64 + thread_block_size - 1) / thread_block_size,
+                width: (mat_size as u64 + thread_block_size - 1) / thread_block_size,
+                height: (mat_size as u64 + thread_block_size - 1) / thread_block_size,
                 depth: 1,
             },
             MTLSize {
@@ -137,343 +210,225 @@ kernel void matmul(
                 depth: 1,
             },
         );
-        let now = std::time::Instant::now();
         encoder.end_encoding();
+        resolve_samples_into_buffer(command_buffer, &counter_sample_buffer, &destination_buffer);
         command_buffer.commit();
         command_buffer.wait_until_completed();
-        let millis = now.elapsed().as_millis();
-
-        let mut c_data = vec![0.0; c_buffer.length() as usize / std::mem::size_of::<f32>()];
-        let ptr = c_buffer.contents() as *mut f32;
-        for (i, d) in c_data.iter_mut().enumerate() {
-            *d = unsafe { *ptr.add(i) };
+        let mut cpu_end = 0;
+        let mut gpu_end = 0;
+        dev.sample_timestamps(&mut cpu_end, &mut gpu_end);
+        match command_buffer.status() {
+            MTLCommandBufferStatus::Completed => Some((
+                copy_from_buffer(&c_buffer),
+                handle_timestamps(&destination_buffer, cpu_start, cpu_end, gpu_start, gpu_end),
+            )),
+            _ => None,
         }
-        (c_data, millis as f32)
-    })
-}
-
-fn run_tiled(
-    a: &Buffer,
-    b: &Buffer,
-    m: usize,
-    n: usize,
-    k: usize,
-    dev: &Device,
-    stored_shader: &mut Option<ComputePipelineState>,
-) -> (Vec<f32>, f32) {
-    autoreleasepool(|| {
-        let shader = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void matmul(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& N [[buffer(4)]],
-    device uint& K [[buffer(5)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint3 global_pos [[thread_position_in_grid]],
-    uint3 local_pos [[thread_position_in_threadgroup]],
-    uint3 block_pos [[threadgroup_position_in_grid]],
-    uint3 block_size[[threads_per_threadgroup]]
-) {
-    int tx = local_pos.x;
-    int ty = local_pos.y;
-    int bx = block_pos.x;
-    int by = block_pos.y;
-    int bx_size = block_size.x;
-    int by_size = block_size.y;
-
-    int row = by * by_size + ty;
-    int col = bx * bx_size + tx;
-
-    float sum = 0.0f;
-
-    for (int m = 0; m < (K + bx_size - 1) / bx_size; m++) {
-        if (m * bx_size + tx < K && row < M) {
-            shared_memory[ty * bx_size + tx] = A[row * K + m * bx_size + tx];
-        } else {
-            shared_memory[ty * bx_size + tx] = 0.0f;
-        }
-
-        if (m * by_size + ty < K && col < N) {
-            shared_memory[(by_size + ty) * bx_size + tx] = B[(m * by_size + ty) * N + col];
-        } else {
-            shared_memory[(by_size + ty) * bx_size + tx] = 0.0f;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (int e = 0; e < bx_size; e++) {
-            sum += shared_memory[ty * bx_size + e] * shared_memory[(by_size + e) * bx_size + tx];
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
-    }
-}
-    ";
-        let c_buffer = dev.new_buffer(
-            (m * n * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModeManaged,
-        );
-
-        let command_queue = dev.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
-        let encoder =
-            command_buffer.compute_command_encoder_with_descriptor(ComputePassDescriptor::new());
-        if stored_shader.is_none() {
-            *stored_shader = Some(compile_function(
-                "matmul",
-                shader,
-                dev,
-                FunctionConstantValues::new(),
-            ));
-        }
-        encoder.set_compute_pipeline_state(stored_shader.as_ref().unwrap());
-        encoder.set_buffer(0, Some(a), 0);
-        encoder.set_buffer(1, Some(b), 0);
-        encoder.set_buffer(2, Some(&c_buffer), 0);
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<u32>() as u64,
-            &(m as u32) as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<u32>() as u64,
-            &(n as u32) as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &(k as u32) as *const u32 as *const _,
-        );
-        let thread_block_size = 32;
-        encoder.set_threadgroup_memory_length(
-            0,
-            thread_block_size * thread_block_size * 2 * std::mem::size_of::<f32>() as u64,
-        );
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: (m as u64 + thread_block_size - 1) / thread_block_size,
-                height: (n as u64 + thread_block_size - 1) / thread_block_size,
-                depth: 1,
-            },
-            MTLSize {
-                width: thread_block_size,
-                height: thread_block_size,
-                depth: 1,
-            },
-        );
-        let now = std::time::Instant::now();
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        let millis = now.elapsed().as_millis();
-
-        let mut c_data = vec![0.0; c_buffer.length() as usize / std::mem::size_of::<f32>()];
-        let ptr = c_buffer.contents() as *mut f32;
-        for (i, d) in c_data.iter_mut().enumerate() {
-            *d = unsafe { *ptr.add(i) };
-        }
-        (c_data, millis as f32)
-    })
-}
-
-fn run_naive(
-    a: &Buffer,
-    b: &Buffer,
-    m: usize,
-    n: usize,
-    k: usize,
-    dev: &Device,
-    stored_shader: &mut Option<ComputePipelineState>,
-) -> (Vec<f32>, f32) {
-    autoreleasepool(|| {
-        let shader = "#include <metal_stdlib>
-    using namespace metal;
-    
-    kernel void matmul(
-        device float *A [[buffer(0)]],
-        device float *B [[buffer(1)]],
-        device float *C [[buffer(2)]],
-        device uint& M [[buffer(3)]],
-        device uint& N [[buffer(4)]],
-        device uint& K [[buffer(5)]],
-        uint3 tid [[thread_position_in_grid]]
-    ) { 
-        uint row = tid.y;
-        uint column = tid.x;
-    
-        if(row < M && column < N) {
-            float value = 0.0f;
-            for(int i = 0; i < K; ++i) {
-                uint A_index = row * K + i;
-                uint B_index = i * N + column;
-                value += A[A_index] * B[B_index];
-            }
-            C[row * N + column] = value;
-        }
-    }
-    ";
-        let c_buffer = dev.new_buffer(
-            (m * n * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModeManaged,
-        );
-
-        let command_queue = dev.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
-        let encoder =
-            command_buffer.compute_command_encoder_with_descriptor(ComputePassDescriptor::new());
-        if stored_shader.is_none() {
-            *stored_shader = Some(compile_function(
-                "matmul",
-                shader,
-                dev,
-                FunctionConstantValues::new(),
-            ));
-        }
-        encoder.set_compute_pipeline_state(stored_shader.as_ref().unwrap());
-        encoder.set_buffer(0, Some(a), 0);
-        encoder.set_buffer(1, Some(b), 0);
-        encoder.set_buffer(2, Some(&c_buffer), 0);
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<u32>() as u64,
-            &(m as u32) as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<u32>() as u64,
-            &(n as u32) as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &(k as u32) as *const u32 as *const _,
-        );
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: (m as u64 + 15) / 16,
-                height: (n as u64 + 15) / 16,
-                depth: 1,
-            },
-            MTLSize {
-                width: 16,
-                height: 16,
-                depth: 1,
-            },
-        );
-        let now = std::time::Instant::now();
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        let millis = now.elapsed().as_millis();
-
-        let mut c_data = vec![0.0; c_buffer.length() as usize / std::mem::size_of::<f32>()];
-        let ptr = c_buffer.contents() as *mut f32;
-        for (i, d) in c_data.iter_mut().enumerate() {
-            *d = unsafe { *ptr.add(i) };
-        }
-        (c_data, millis as f32)
     })
 }
 
 fn main() {
-    let mat_size = 2048;
-    let iters = 500;
-    let mut rng = StdRng::seed_from_u64(0);
-    let a_data: Vec<f32> = (0..(mat_size * mat_size))
-        .map(|_| rng.gen_range(-0.5..0.5))
-        .collect();
-    let b_data: Vec<f32> = (0..(mat_size * mat_size))
-        .map(|_| rng.gen_range(-0.5..0.5))
-        .collect();
-    let dev = Device::system_default().unwrap();
-    let a_buffer = dev.new_buffer_with_data(
-        unsafe { std::mem::transmute(a_data.as_ptr()) },
-        (a_data.len() * std::mem::size_of::<f32>()) as u64,
-        MTLResourceOptions::StorageModeManaged,
+    autoreleasepool(|| {
+        let mat_size = 4096 * 2;
+        let iters = 100;
+        let mut rng = StdRng::seed_from_u64(0);
+        let a_data: Vec<f32> = (0..(mat_size * mat_size))
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+        let b_data: Vec<f32> = (0..(mat_size * mat_size))
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+
+        let dev = Device::system_default().unwrap();
+        let a_buffer = copy_to_buffer(&a_data, &dev);
+        let b_buffer = copy_to_buffer(&b_data, &dev);
+
+        let shader = compile_function("matmul", NAIEVE_SHADER, &dev);
+        let mut data: Option<Vec<f32>> = None;
+        let mut successes = 0;
+        let mut total_time = 0.0;
+        for _ in 0..iters {
+            let curr_data = run(&a_buffer, &b_buffer, &shader, &dev, mat_size);
+            if let Some((curr_data, time)) = curr_data {
+                match &mut data {
+                    Some(d) => {
+                        successes += 1;
+                        total_time += time;
+                        for (i, (a, b)) in d.iter().zip(curr_data.iter()).enumerate() {
+                            if (*a - *b).abs() > 1e-5 {
+                                println!("Index {i} A: {a} B: {b}");
+                            }
+                        }
+                    }
+                    None => {
+                        data = Some(curr_data);
+                    }
+                }
+            }
+        }
+        println!("Naieve Time: {}ms", total_time / successes as f32);
+
+        let shader = compile_function("tiled_matmul", TILED_SHADER, &dev);
+        let mut successes = 0;
+        let mut total_time = 0.0;
+        for _ in 0..iters {
+            let curr_data = run(&a_buffer, &b_buffer, &shader, &dev, mat_size);
+            if let Some((curr_data, time)) = curr_data {
+                match &mut data {
+                    Some(d) => {
+                        successes += 1;
+                        total_time += time;
+                        for (i, (a, b)) in d.iter().zip(curr_data.iter()).enumerate() {
+                            if (*a - *b).abs() > 1e-5 {
+                                println!("Index {i} A: {a} B: {b}");
+                            }
+                        }
+                    }
+                    None => {
+                        data = Some(curr_data);
+                    }
+                }
+            }
+        }
+
+        println!("Tiled Time: {}ms", total_time / successes as f32);
+
+        let shader = compile_function("prefetch_matmul", PREFETCH_SHADER, &dev);
+        let mut successes = 0;
+        let mut total_time = 0.0;
+        for _ in 0..iters {
+            let curr_data = run(&a_buffer, &b_buffer, &shader, &dev, mat_size);
+            if let Some((curr_data, time)) = curr_data {
+                match &mut data {
+                    Some(d) => {
+                        successes += 1;
+                        total_time += time;
+                        for (i, (a, b)) in d.iter().zip(curr_data.iter()).enumerate() {
+                            if (*a - *b).abs() > 1e-5 {
+                                println!("Index {i} A: {a} B: {b}");
+                            }
+                        }
+                    }
+                    None => {
+                        data = Some(curr_data);
+                    }
+                }
+            }
+        }
+
+        println!("Prefetch Time: {}ms", total_time / successes as f32);
+    })
+}
+
+fn set_input_u32(encoder: &ComputeCommandEncoderRef, num: u32, index: u64) {
+    encoder.set_bytes(
+        index,
+        std::mem::size_of::<u32>() as u64,
+        &(num) as *const u32 as *const _,
     );
-    let b_buffer = dev.new_buffer_with_data(
-        unsafe { std::mem::transmute(b_data.as_ptr()) },
-        (b_data.len() * std::mem::size_of::<f32>()) as u64,
-        MTLResourceOptions::StorageModeManaged,
-    );
-    let (mut naieve, mut tiled, mut prefetch) = (0., 0., 0.);
-    let (mut naieve_shader, mut tiled_shader) = (None, None);
-    for _ in 0..iters {
-        let (a, a_time) = autoreleasepool(|| {
-            run_naive(
-                &a_buffer,
-                &b_buffer,
-                mat_size,
-                mat_size,
-                mat_size,
-                &dev,
-                &mut naieve_shader,
-            )
-        });
-        naieve += a_time;
-        let (b, b_time) = autoreleasepool(|| {
-            run_tiled(
-                &a_buffer,
-                &b_buffer,
-                mat_size,
-                mat_size,
-                mat_size,
-                &dev,
-                &mut tiled_shader,
-            )
-        });
-        tiled += b_time;
-        assert_eq!(a, b, "A not equal to B");
-        // let (c, c_time) = autoreleasepool(|| {
-        //     run_tiled_prefetch(&a_buffer, &b_buffer, mat_size, mat_size, mat_size, &dev)
-        // });
-        // prefetch += c_time;
-        // assert_eq!(b, c, "B not equal to C");
+}
+
+fn copy_to_buffer(v: &[f32], dev: &Device) -> Buffer {
+    dev.new_buffer_with_data(
+        unsafe { std::mem::transmute(v.as_ptr()) },
+        std::mem::size_of_val(v) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
+fn copy_from_buffer(buffer: &Buffer) -> Vec<f32> {
+    let mut data = vec![0.0; buffer.length() as usize / std::mem::size_of::<f32>()];
+    let ptr = buffer.contents() as *mut f32;
+    for (i, d) in data.iter_mut().enumerate() {
+        *d = unsafe { *ptr.add(i) };
     }
-    println!(
-        "Naieve: {}ms, Tiled: {}ms, Prefetch: {}ms",
-        naieve / iters as f32,
-        tiled / iters as f32,
-        prefetch / iters as f32,
-    );
+    data
 }
 
-trait SetConstant {
-    fn constant<T>(&self, val: T, index: u64, dtype: MTLDataType);
-}
-
-impl SetConstant for FunctionConstantValues {
-    fn constant<T>(&self, val: T, index: u64, dtype: MTLDataType) {
-        self.set_constant_value_at_index(&val as *const T as *const c_void, dtype, index);
-    }
-}
-
-fn compile_function(
-    name: &str,
-    code: &str,
-    device: &Device,
-    constants: FunctionConstantValues,
-) -> ComputePipelineState {
+fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineState {
     let library = device
         .new_library_with_source(code, &CompileOptions::new())
         .unwrap();
     let pipeline_state_descriptor = ComputePipelineDescriptor::new();
     pipeline_state_descriptor
-        .set_compute_function(Some(&library.get_function(name, Some(constants)).unwrap()));
-
+        .set_compute_function(Some(&library.get_function(name, None).unwrap()));
     device
         .new_compute_pipeline_state_with_function(
             pipeline_state_descriptor.compute_function().unwrap(),
         )
+        .unwrap()
+}
+
+fn handle_compute_pass_sample_buffer_attachment(
+    compute_pass_descriptor: &ComputePassDescriptorRef,
+    counter_sample_buffer: &CounterSampleBufferRef,
+) {
+    let sample_buffer_attachment_descriptor = compute_pass_descriptor
+        .sample_buffer_attachments()
+        .object_at(0)
+        .unwrap();
+
+    sample_buffer_attachment_descriptor.set_sample_buffer(counter_sample_buffer);
+    sample_buffer_attachment_descriptor.set_start_of_encoder_sample_index(0);
+    sample_buffer_attachment_descriptor.set_end_of_encoder_sample_index(1);
+}
+
+fn resolve_samples_into_buffer(
+    command_buffer: &CommandBufferRef,
+    counter_sample_buffer: &CounterSampleBufferRef,
+    destination_buffer: &BufferRef,
+) {
+    let blit_encoder = command_buffer.new_blit_command_encoder();
+    blit_encoder.resolve_counters(
+        counter_sample_buffer,
+        NSRange::new(0_u64, NUM_SAMPLES),
+        destination_buffer,
+        0_u64,
+    );
+    blit_encoder.end_encoding();
+}
+
+fn handle_timestamps(
+    resolved_sample_buffer: &BufferRef,
+    cpu_start: u64,
+    cpu_end: u64,
+    gpu_start: u64,
+    gpu_end: u64,
+) -> f32 {
+    let samples = unsafe {
+        std::slice::from_raw_parts(
+            resolved_sample_buffer.contents() as *const u64,
+            NUM_SAMPLES as usize,
+        )
+    };
+    let pass_start = samples[0];
+    let pass_end = samples[1];
+
+    let cpu_time_span = cpu_end - cpu_start;
+    let gpu_time_span = gpu_end - gpu_start;
+
+    let millis = milliseconds_between_begin(pass_start, pass_end, gpu_time_span, cpu_time_span);
+    millis as f32
+}
+
+fn milliseconds_between_begin(begin: u64, end: u64, gpu_time_span: u64, cpu_time_span: u64) -> f64 {
+    let time_span = (end as f64) - (begin as f64);
+    let nanoseconds = time_span / (gpu_time_span as f64) * (cpu_time_span as f64);
+    nanoseconds / 1_000_000.0
+}
+
+fn create_counter_sample_buffer(device: &Device) -> CounterSampleBuffer {
+    let counter_sample_buffer_desc = metal::CounterSampleBufferDescriptor::new();
+    counter_sample_buffer_desc.set_storage_mode(metal::MTLStorageMode::Shared);
+    counter_sample_buffer_desc.set_sample_count(NUM_SAMPLES);
+    let counter_sets = device.counter_sets();
+
+    let timestamp_counter = counter_sets.iter().find(|cs| cs.name() == "timestamp");
+
+    counter_sample_buffer_desc
+        .set_counter_set(timestamp_counter.expect("No timestamp counter found"));
+
+    device
+        .new_counter_sample_buffer_with_descriptor(&counter_sample_buffer_desc)
         .unwrap()
 }
