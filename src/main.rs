@@ -6,7 +6,7 @@ use metal::{
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-const NUM_SAMPLES: u64 = 20;
+const NUM_SAMPLES: u64 = 10;
 
 const NAIEVE_SHADER: &str = "
 #include <metal_stdlib>
@@ -19,14 +19,18 @@ kernel void matmul(
     device uint& M [[buffer(3)]],
     device uint& N [[buffer(4)]],
     device uint& K [[buffer(5)]],
-    uint3 tid [[thread_position_in_grid]]
+    threadgroup float* shared_memory [[threadgroup(0)]],
+    uint3 global_pos [[thread_position_in_grid]],
+    uint3 local_pos [[thread_position_in_threadgroup]],
+    uint3 block_pos [[threadgroup_position_in_grid]],
+    uint3 block_size[[threads_per_threadgroup]]
 ) {
-    if(tid.y < M && tid.x < N) {
+    if (global_pos.x < N && global_pos.y < M) {
         float value = 0.0f;
         for(int i = 0; i < K; ++i) {
-            value = fast::fma(A[tid.y * K + i], B[i * N + tid.x], value);
+            value = fast::fma(A[global_pos.y * K + i], B[i * N + global_pos.x], value);
         }
-        C[tid.y * N + tid.x] = value;
+        C[global_pos.y * N + global_pos.x] = value;
     }
 }";
 
@@ -47,22 +51,19 @@ kernel void tiled_matmul(
     uint3 block_pos [[threadgroup_position_in_grid]],
     uint3 block_size[[threads_per_threadgroup]]
 ) {
-    int row = block_pos.y * block_size.y + local_pos.y;
-    int col = block_pos.x * block_size.x + local_pos.x;
-
-    if (row >= M || col >= N) return;
-
     float sum = 0.0f;
+
+    if (global_pos.y >= M || global_pos.x >= N) return;
 
     for (int m = 0; m < (K + block_size.x - 1) / block_size.x; ++m) {
         if (m * block_size.x + local_pos.x < K) {
-            shared_memory[local_pos.y * block_size.x + local_pos.x] = A[row * K + m * block_size.x + local_pos.x];
+            shared_memory[local_pos.y * block_size.x + local_pos.x] = A[global_pos.y * K + m * block_size.x + local_pos.x];
         } else {
             shared_memory[local_pos.y * block_size.x + local_pos.x] = 0.0f;
         }
 
         if (m * block_size.y + local_pos.y < K) {
-            shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = B[(m * block_size.y + local_pos.y) * N + col];
+            shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = B[(m * block_size.y + local_pos.y) * N + global_pos.x];
         } else {
             shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = 0.0f;
         }
@@ -76,7 +77,7 @@ kernel void tiled_matmul(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    C[row * N + col] = sum;
+    C[global_pos.y * N + (global_pos.x)] = sum;
 }";
 
 const PREFETCH_SHADER: &str = "
@@ -96,34 +97,30 @@ kernel void prefetch_matmul(
     uint3 block_pos [[threadgroup_position_in_grid]],
     uint3 block_size[[threads_per_threadgroup]]
 ) {
-    int row = block_pos.y * block_size.y + local_pos.y;
-    int col = block_pos.x * block_size.x + local_pos.x;
-
-    if (row >= M || col >= N) return;
+    if (global_pos.y >= M || global_pos.x >= N) return;
 
     float sum = 0.0f;
-    int numTiles = (K + block_size.x - 1) / block_size.x;
 
     threadgroup float* tile0 = shared_memory;
     threadgroup float* tile1 = shared_memory + block_size.x * block_size.y * 2;
 
     if (local_pos.x < K) {
-        tile0[local_pos.y * block_size.x + local_pos.x] = A[row * K + local_pos.x];
+        tile0[local_pos.y * block_size.x + local_pos.x] = A[global_pos.y * K + local_pos.x];
     } else {
         tile0[local_pos.y * block_size.x + local_pos.x] = 0.0f;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int m = 1; m < numTiles; ++m) {
+    for (int m = 1; m < (K + block_size.x - 1) / block_size.x; ++m) {
         if (m * block_size.x + local_pos.x < K) {
-            tile1[local_pos.y * block_size.x + local_pos.x] = A[row * K + m * block_size.x + local_pos.x];
+            tile1[local_pos.y * block_size.x + local_pos.x] = A[global_pos.y * K + m * block_size.x + local_pos.x];
         } else {
             tile1[local_pos.y * block_size.x + local_pos.x] = 0.0f;
         }
 
         for (int e = 0; e < block_size.x; ++e) {
-            sum = fast::fma(tile0[local_pos.y * block_size.x + e], B[(m - 1) * block_size.y * N + e * N + col], sum);
+            sum = fast::fma(tile0[local_pos.y * block_size.x + e], B[(m - 1) * block_size.y * N + e * N + global_pos.x], sum);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -133,11 +130,7 @@ kernel void prefetch_matmul(
         tile1 = temp;
     }
 
-    for (int e = 0; e < block_size.x; ++e) {
-        sum = fast::fma(tile0[local_pos.y * block_size.x + e], B[(numTiles - 1) * block_size.y * N + e * N + col], sum);
-    }
-
-    C[row * N + col] = sum;
+    C[global_pos.y * N + global_pos.x] = sum;
 }";
 
 fn run(
@@ -155,12 +148,12 @@ fn run(
         let counter_sample_buffer = create_counter_sample_buffer(dev);
         let destination_buffer = dev.new_buffer(
             (std::mem::size_of::<u64>() * NUM_SAMPLES as usize) as u64,
-            MTLResourceOptions::StorageModeShared,
+            MTLResourceOptions::StorageModeManaged,
         );
 
         let c_buffer = dev.new_buffer(
             (mat_size * mat_size * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
+            MTLResourceOptions::StorageModeManaged,
         );
         let command_queue = dev.new_command_queue();
         let command_buffer = command_queue.new_command_buffer();
@@ -217,7 +210,7 @@ fn run(
 
 fn main() {
     autoreleasepool(|| {
-        let mat_size = 4096 * 2;
+        let mat_size = 8192;
         let iters = 100;
         let mut rng = StdRng::seed_from_u64(0);
         let a_data: Vec<f32> = (0..(mat_size * mat_size))
@@ -320,7 +313,7 @@ fn copy_to_buffer(v: &[f32], dev: &Device) -> Buffer {
     dev.new_buffer_with_data(
         unsafe { std::mem::transmute(v.as_ptr()) },
         std::mem::size_of_val(v) as u64,
-        MTLResourceOptions::StorageModeShared,
+        MTLResourceOptions::StorageModeManaged,
     )
 }
 
@@ -334,9 +327,9 @@ fn copy_from_buffer(buffer: &Buffer) -> Vec<f32> {
 }
 
 fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineState {
-    let opts = CompileOptions::new();
-    opts.set_preserve_invariance(true);
-    let library = device.new_library_with_source(code, &opts).unwrap();
+    let library = device
+        .new_library_with_source(code, &CompileOptions::new())
+        .unwrap();
     let pipeline_state_descriptor = ComputePipelineDescriptor::new();
     pipeline_state_descriptor
         .set_compute_function(Some(&library.get_function(name, None).unwrap()));
