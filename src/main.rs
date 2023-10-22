@@ -24,7 +24,7 @@ kernel void matmul(
     if(tid.y < M && tid.x < N) {
         float value = 0.0f;
         for(int i = 0; i < K; ++i) {
-            value = fma(A[tid.y * K + i], B[i * N + tid.x], value);
+            value = fast::fma(A[tid.y * K + i], B[i * N + tid.x], value);
         }
         C[tid.y * N + tid.x] = value;
     }
@@ -50,16 +50,18 @@ kernel void tiled_matmul(
     int row = block_pos.y * block_size.y + local_pos.y;
     int col = block_pos.x * block_size.x + local_pos.x;
 
+    if (row >= M || col >= N) return;
+
     float sum = 0.0f;
 
     for (int m = 0; m < (K + block_size.x - 1) / block_size.x; ++m) {
-        if (m * block_size.x + local_pos.x < K && row < M) {
+        if (m * block_size.x + local_pos.x < K) {
             shared_memory[local_pos.y * block_size.x + local_pos.x] = A[row * K + m * block_size.x + local_pos.x];
         } else {
             shared_memory[local_pos.y * block_size.x + local_pos.x] = 0.0f;
         }
 
-        if (m * block_size.y + local_pos.y < K && col < N) {
+        if (m * block_size.y + local_pos.y < K) {
             shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = B[(m * block_size.y + local_pos.y) * N + col];
         } else {
             shared_memory[(block_size.y + local_pos.y) * block_size.x + local_pos.x] = 0.0f;
@@ -68,15 +70,13 @@ kernel void tiled_matmul(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int e = 0; e < block_size.x; ++e) {
-            sum = fma(shared_memory[local_pos.y * block_size.x + e], shared_memory[(block_size.y + e) * block_size.x + local_pos.x], sum);
+            sum = fast::fma(shared_memory[local_pos.y * block_size.x + e], shared_memory[(block_size.y + e) * block_size.x + local_pos.x], sum);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
-    }
+    C[row * N + col] = sum;
 }";
 
 const PREFETCH_SHADER: &str = "
@@ -96,60 +96,48 @@ kernel void prefetch_matmul(
     uint3 block_pos [[threadgroup_position_in_grid]],
     uint3 block_size[[threads_per_threadgroup]]
 ) {
-    int tx = local_pos.x;
-    int ty = local_pos.y;
-    int bx = block_pos.x;
-    int by = block_pos.y;
+    int row = block_pos.y * block_size.y + local_pos.y;
+    int col = block_pos.x * block_size.x + local_pos.x;
 
-    threadgroup float* shared_memory_0 = shared_memory;
-    threadgroup float* shared_memory_1 = shared_memory + (block_size.x * block_size.y * 2);
-    int row = by * block_size.y + ty;
-    int col = bx * block_size.x + tx;
+    if (row >= M || col >= N) return;
 
     float sum = 0.0f;
+    int numTiles = (K + block_size.x - 1) / block_size.x;
 
-    int m = 0;
-    if (m * block_size.x + tx < K && row < M) {
-        shared_memory_0[ty * block_size.x + tx] = A[row * K + m * block_size.x + tx];
-    } else {
-        shared_memory_0[ty * block_size.x + tx] = 0.0f;
-    }
+    threadgroup float* tile0 = shared_memory;
+    threadgroup float* tile1 = shared_memory + block_size.x * block_size.y * 2;
 
-    if (m * block_size.y + ty < K && col < N) {
-        shared_memory_0[(block_size.y + ty) * block_size.x + tx] = B[(m * block_size.y + ty) * N + col];
+    if (local_pos.x < K) {
+        tile0[local_pos.y * block_size.x + local_pos.x] = A[row * K + local_pos.x];
     } else {
-        shared_memory_0[(block_size.y + ty) * block_size.x + tx] = 0.0f;
+        tile0[local_pos.y * block_size.x + local_pos.x] = 0.0f;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int m = 0; m < (K + block_size.x - 1) / block_size.x; ++m) {
-        if ((m + 1) * block_size.x + tx < K && row < M) {
-            shared_memory_1[ty * block_size.x + tx] = A[row * K + (m + 1) * block_size.x + tx];
+    for (int m = 1; m < numTiles; ++m) {
+        if (m * block_size.x + local_pos.x < K) {
+            tile1[local_pos.y * block_size.x + local_pos.x] = A[row * K + m * block_size.x + local_pos.x];
         } else {
-            shared_memory_1[ty * block_size.x + tx] = 0.0f;
-        }
-
-        if ((m + 1) * block_size.y + ty < K && col < N) {
-            shared_memory_1[(block_size.y + ty) * block_size.x + tx] = B[((m + 1) * block_size.y + ty) * N + col];
-        } else {
-            shared_memory_1[(block_size.y + ty) * block_size.x + tx] = 0.0f;
+            tile1[local_pos.y * block_size.x + local_pos.x] = 0.0f;
         }
 
         for (int e = 0; e < block_size.x; ++e) {
-            sum = fma(shared_memory_0[ty * block_size.x + e], shared_memory_0[(block_size.y + e) * block_size.x + tx], sum);
+            sum = fast::fma(tile0[local_pos.y * block_size.x + e], B[(m - 1) * block_size.y * N + e * N + col], sum);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup float* tmp = shared_memory_0;
-        shared_memory_0 = shared_memory_1;
-        shared_memory_1 = tmp;
+        threadgroup float* temp = tile0;
+        tile0 = tile1;
+        tile1 = temp;
     }
 
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
+    for (int e = 0; e < block_size.x; ++e) {
+        sum = fast::fma(tile0[local_pos.y * block_size.x + e], B[(numTiles - 1) * block_size.y * N + e * N + col], sum);
     }
+
+    C[row * N + col] = sum;
 }";
 
 fn run(
@@ -346,9 +334,9 @@ fn copy_from_buffer(buffer: &Buffer) -> Vec<f32> {
 }
 
 fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineState {
-    let library = device
-        .new_library_with_source(code, &CompileOptions::new())
-        .unwrap();
+    let opts = CompileOptions::new();
+    opts.set_preserve_invariance(true);
+    let library = device.new_library_with_source(code, &opts).unwrap();
     let pipeline_state_descriptor = ComputePipelineDescriptor::new();
     pipeline_state_descriptor
         .set_compute_function(Some(&library.get_function(name, None).unwrap()));
