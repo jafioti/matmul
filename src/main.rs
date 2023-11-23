@@ -112,12 +112,13 @@ kernel void prefetch(
             sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + local_pos.x + square_block_size], sum);
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         // Swap pointers
         temp = tile0;
         tile0 = tile1;
-        tile1 = temp;        
+        tile1 = temp;
+
+        // Wait
+        threadgroup_barrier(mem_flags::mem_threadgroup); 
     }
 
     // Compute final block
@@ -149,7 +150,7 @@ fn setup_command_encoder(
     let thread_block_size = 32;
     encoder.set_threadgroup_memory_length(
         0,
-        4 * thread_block_size * thread_block_size * std::mem::size_of::<f32>() as u64,
+        4 * 2 * thread_block_size * thread_block_size * std::mem::size_of::<f32>() as u64,
     );
     encoder.dispatch_threads(
         MTLSize {
@@ -248,28 +249,28 @@ fn main() {
                     .sum::<f32>()
                     / trials as f32
             );
-            println!(
-                "2: {}ms",
-                (0..trials)
-                    .map(
-                        |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 2)
-                            .unwrap()
-                            .1
-                    )
-                    .sum::<f32>()
-                    / trials as f32
-            );
-            println!(
-                "5: {}ms",
-                (0..trials)
-                    .map(
-                        |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 5)
-                            .unwrap()
-                            .1
-                    )
-                    .sum::<f32>()
-                    / trials as f32
-            );
+            // println!(
+            //     "2: {}ms",
+            //     (0..trials)
+            //         .map(
+            //             |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 2)
+            //                 .unwrap()
+            //                 .1
+            //         )
+            //         .sum::<f32>()
+            //         / trials as f32
+            // );
+            // println!(
+            //     "5: {}ms",
+            //     (0..trials)
+            //         .map(
+            //             |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 5)
+            //                 .unwrap()
+            //                 .1
+            //         )
+            //         .sum::<f32>()
+            //         / trials as f32
+            // );
             // println!(
             //     "10: {}ms",
             //     (0..trials)
@@ -345,8 +346,9 @@ fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineS
 }
 
 fn assert_close(a: &[f32], b: &[f32]) {
+    println!("{}", a.len());
     assert_eq!(a.len(), b.len());
-    for (a, b) in a.iter().zip(b.iter()) {
-        assert!((a - b).abs() < 1e-3);
+    for (i, (a, b)) in a.iter().zip(b.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-3, "{a} : {b}\ni: {i}",);
     }
 }
