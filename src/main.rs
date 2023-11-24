@@ -20,14 +20,13 @@ kernel void naieve(
     uint3 global_pos [[thread_position_in_grid]],
     uint3 block_size[[threads_per_threadgroup]]
 ) {
-    if (global_pos.x < N && global_pos.y < M) {
-        float value = 0.0f;
-        uint pos_k = global_pos.y * K;
-        for (int i = 0; i < K; ++i) {
-            value = fast::fma(A[pos_k + i], B[i * N + global_pos.x], value);
-        }
-        C[global_pos.y * N + global_pos.x] = value;
+    if (global_pos.y >= M || global_pos.x >= N) return;
+    float value = 0.0f;
+    uint pos_k = global_pos.y * K;
+    for (int i = 0; i < K; ++i) {
+        value = fast::fma(A[pos_k + i], B[i * N + global_pos.x], value);
     }
+    C[global_pos.y * N + global_pos.x] = value;
 }";
 
 const TILED_SHADER: &str = "
@@ -60,6 +59,7 @@ kernel void tiled(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma unroll(32)
         for (uint e = 0; e < block_size.x; ++e) {
             sum = fast::fma(shared_memory[local_y_block_size + e], b_start[e * block_size.x + local_pos.x], sum);
         }
@@ -93,7 +93,8 @@ kernel void prefetch(
 
     uint local_y_block_size = local_pos.y * block_size.x;
     uint a_addr = local_y_block_size + local_pos.x;
-    uint b_addr = local_pos.y * block_size.x + local_pos.x + square_block_size;
+    uint posx_block_size = local_pos.x + square_block_size;
+    uint b_addr = local_pos.y * block_size.x + posx_block_size;
     uint a_ind = global_pos.y * K + local_pos.x;
 
     // First tile prefetch
@@ -108,8 +109,9 @@ kernel void prefetch(
         tile1[b_addr] = B[(m + local_pos.y) * N + global_pos.x];
 
         // Compute current block
+        #pragma unroll(32)
         for (uint e = 0; e < block_size.x; ++e) {
-            sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + local_pos.x + square_block_size], sum);
+            sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + posx_block_size], sum);
         }
 
         // Swap pointers
@@ -122,8 +124,9 @@ kernel void prefetch(
     }
 
     // Compute final block
+    #pragma unroll(32)
     for (uint e = 0; e < block_size.x; ++e) {
-        sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + local_pos.x + square_block_size], sum);
+        sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + posx_block_size], sum);
     }
 
     C[global_pos.y * N + global_pos.x] = sum;
@@ -346,7 +349,6 @@ fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineS
 }
 
 fn assert_close(a: &[f32], b: &[f32]) {
-    println!("{}", a.len());
     assert_eq!(a.len(), b.len());
     for (i, (a, b)) in a.iter().zip(b.iter()).enumerate() {
         assert!((a - b).abs() < 1e-3, "{a} : {b}\ni: {i}",);
