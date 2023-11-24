@@ -4,133 +4,12 @@ use metal::{
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::fs;
 
-const NAIVE_SHADER: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void naieve(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& N [[buffer(4)]],
-    device uint& K [[buffer(5)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint3 global_pos [[thread_position_in_grid]],
-    uint3 block_size[[threads_per_threadgroup]]
-) {
-    if (global_pos.y >= M || global_pos.x >= N) return;
-    float value = 0.0f;
-    uint pos_k = global_pos.y * K;
-    for (int i = 0; i < K; ++i) {
-        value = fast::fma(A[pos_k + i], B[i * N + global_pos.x], value);
-    }
-    C[global_pos.y * N + global_pos.x] = value;
-}";
-
-const TILED_SHADER: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void tiled(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& N [[buffer(4)]],
-    device uint& K [[buffer(5)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint3 global_pos [[thread_position_in_grid]],
-    uint3 local_pos [[thread_position_in_threadgroup]],
-    uint3 block_size [[threads_per_threadgroup]]
-) {
-    if (global_pos.y >= M || global_pos.x >= N) return;
-    float sum = 0.0f;
-
-    threadgroup float* b_start = shared_memory + block_size.x * block_size.x;
-    uint local_y_block_size = local_pos.y * block_size.x;
-    uint a_addr = local_y_block_size + local_pos.x;
-    uint b_addr = local_pos.y * block_size.x + local_pos.x;
-    uint a_ind = global_pos.y * K + local_pos.x;
-    for (uint m = 0; m < K; m += block_size.x) {
-        shared_memory[a_addr] = A[a_ind + m];
-        b_start[b_addr] = B[(m + local_pos.y) * N + global_pos.x];
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        #pragma unroll(32)
-        for (uint e = 0; e < block_size.x; ++e) {
-            sum = fast::fma(shared_memory[local_y_block_size + e], b_start[e * block_size.x + local_pos.x], sum);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    C[global_pos.y * N + global_pos.x] = sum;
-}";
-
-const PREFETCH_SHADER: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void prefetch(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& N [[buffer(4)]],
-    device uint& K [[buffer(5)]],
-    threadgroup float* tile0 [[threadgroup(0)]],
-    uint3 global_pos [[thread_position_in_grid]],
-    uint3 local_pos [[thread_position_in_threadgroup]],
-    uint3 block_size [[threads_per_threadgroup]]
-) {
-    if (global_pos.y >= M || global_pos.x >= N) return;
-    float sum = 0.0f;
-    uint square_block_size = block_size.x * block_size.x;
-    threadgroup float* tile1 = tile0 + square_block_size * 2;
-    threadgroup float* temp;
-
-    uint local_y_block_size = local_pos.y * block_size.x;
-    uint a_addr = local_y_block_size + local_pos.x;
-    uint posx_block_size = local_pos.x + square_block_size;
-    uint b_addr = local_pos.y * block_size.x + posx_block_size;
-    uint a_ind = global_pos.y * K + local_pos.x;
-
-    // First tile prefetch
-    tile0[a_addr] = A[a_ind];
-    tile0[b_addr] = B[local_pos.y * N + global_pos.x];
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint m = block_size.x; m < K; m += block_size.x) {
-        // Prefetch next block
-        tile1[a_addr] = A[a_ind + m];
-        tile1[b_addr] = B[(m + local_pos.y) * N + global_pos.x];
-
-        // Compute current block
-        #pragma unroll(32)
-        for (uint e = 0; e < block_size.x; ++e) {
-            sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + posx_block_size], sum);
-        }
-
-        // Swap pointers
-        temp = tile0;
-        tile0 = tile1;
-        tile1 = temp;
-
-        // Wait
-        threadgroup_barrier(mem_flags::mem_threadgroup); 
-    }
-
-    // Compute final block
-    #pragma unroll(32)
-    for (uint e = 0; e < block_size.x; ++e) {
-        sum = fast::fma(tile0[local_y_block_size + e], tile0[e * block_size.x + posx_block_size], sum);
-    }
-
-    C[global_pos.y * N + global_pos.x] = sum;
-}";
+fn read_shader_from_file(file_path: &str) -> String {
+    fs::read_to_string(file_path)
+        .unwrap_or_else(|_| panic!("Failed to read shader file {}", file_path))
+}
 
 fn setup_command_encoder(
     command_buffer: &CommandBufferRef,
@@ -139,6 +18,9 @@ fn setup_command_encoder(
     c_buffer: &Buffer,
     shader: &ComputePipelineState,
     mat_size: usize,
+    simd_size: u64,
+    thread_block_size: u64,
+    tile_count: u64,
 ) {
     let encoder =
         command_buffer.compute_command_encoder_with_descriptor(ComputePassDescriptor::new());
@@ -150,20 +32,29 @@ fn setup_command_encoder(
     set_input_u32(encoder, mat_size as u32, 3);
     set_input_u32(encoder, mat_size as u32, 4);
     set_input_u32(encoder, mat_size as u32, 5);
-    let thread_block_size = 32;
+    // let thread_block_size = 32;
     encoder.set_threadgroup_memory_length(
         0,
-        4 * 2 * thread_block_size * thread_block_size * std::mem::size_of::<f32>() as u64,
+        4 * thread_block_size * thread_block_size * std::mem::size_of::<f32>() as u64,
     );
     encoder.dispatch_threads(
         MTLSize {
             width: mat_size as u64,
-            height: mat_size as u64,
+            height: mat_size as u64
+                / if tile_count == 1 {
+                    1
+                } else {
+                    simd_size * 2 * tile_count
+                },
             depth: 1,
         },
         MTLSize {
             width: thread_block_size,
-            height: thread_block_size,
+            height: if tile_count == 1 {
+                thread_block_size
+            } else {
+                tile_count
+            },
             depth: 1,
         },
     );
@@ -178,10 +69,15 @@ fn run_n_times(
     dev: &Device,
     queue: &CommandQueue,
     n: usize,
+    simd_size: u64,
+    tiled: bool,
 ) -> Option<(Vec<f32>, f32)> {
     autoreleasepool(|| {
         let c_buffer = copy_to_buffer(&vec![0.; mat_size * mat_size], dev);
         let command_buffer = queue.new_command_buffer();
+
+        let thread_block_size = 32;
+        let tile_count = if tiled { 2 } else { 1 };
 
         for _ in 0..n {
             setup_command_encoder(
@@ -191,6 +87,9 @@ fn run_n_times(
                 &c_buffer,
                 shader,
                 mat_size,
+                simd_size,
+                thread_block_size,
+                tile_count,
             );
         }
 
@@ -210,6 +109,7 @@ fn run_n_times(
 fn main() {
     autoreleasepool(|| {
         let mat_size = 4096;
+        // let mat_size = 16;
         let trials = 10;
         let mut rng = StdRng::seed_from_u64(0);
         let a_data: Vec<f32> = (0..(mat_size * mat_size))
@@ -219,61 +119,103 @@ fn main() {
             .map(|_| rng.gen_range(-0.5..0.5))
             .collect();
 
+        // println!("{:#?} @ {:#?}", a_data, b_data);
+
         let dev = Device::system_default().unwrap();
         let queue = dev.new_command_queue();
         let a_buffer = copy_to_buffer(&a_data, &dev);
         let b_buffer = copy_to_buffer(&b_data, &dev);
 
         let shaders = [
-            (NAIVE_SHADER, "naieve"),
-            (TILED_SHADER, "tiled"),
-            (PREFETCH_SHADER, "prefetch"),
+            ("./src/shaders/naive.metal", "naive", false, 1),
+            ("./src/shaders/tiled.metal", "tiled", false, 1),
+            ("./src/shaders/prefetch.metal", "prefetch", false, 1),
+            ("./src/shaders/simd.metal", "simd", true, 8),
         ];
-        let shader = compile_function("naieve", NAIVE_SHADER, &dev);
-        let reference = run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 1)
+
+        let shader_source = read_shader_from_file("./src/shaders/naive.metal");
+        let shader = compile_function("naive", &shader_source, &dev);
+        let reference = run_n_times(
+            &a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 1, 1, false,
+        )
+        .unwrap()
+        .0;
+        for (shader_path, name, tiled, simd_size) in shaders {
+            println!("{name}");
+            let shader_source = read_shader_from_file(shader_path);
+            let compiled_shader = compile_function(name, &shader_source, &dev);
+            let res = run_n_times(
+                &a_buffer,
+                &b_buffer,
+                mat_size,
+                &compiled_shader,
+                &dev,
+                &queue,
+                1,
+                simd_size,
+                tiled,
+            )
             .unwrap()
             .0;
-        for (shader, name) in shaders {
-            println!("{name}");
-            let shader = compile_function(name, shader, &dev);
-            let res = run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 1)
-                .unwrap()
-                .0;
-            println!("Res: {:?}", &res[..10]);
+
             assert_close(&res, &reference);
             println!(
                 "1: {}ms",
                 (0..trials)
-                    .map(
-                        |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 1)
-                            .unwrap()
-                            .1
+                    .map(|_| run_n_times(
+                        &a_buffer,
+                        &b_buffer,
+                        mat_size,
+                        &compiled_shader,
+                        &dev,
+                        &queue,
+                        1,
+                        simd_size,
+                        tiled,
                     )
+                    .unwrap()
+                    .1)
                     .sum::<f32>()
                     / trials as f32
             );
-            // println!(
-            //     "2: {}ms",
-            //     (0..trials)
-            //         .map(
-            //             |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 2)
-            //                 .unwrap()
-            //                 .1
-            //         )
-            //         .sum::<f32>()
-            //         / trials as f32
-            // );
-            // println!(
-            //     "5: {}ms",
-            //     (0..trials)
-            //         .map(
-            //             |_| run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 5)
-            //                 .unwrap()
-            //                 .1
-            //         )
-            //         .sum::<f32>()
-            //         / trials as f32
-            // );
+            println!(
+                "2: {}ms",
+                (0..trials)
+                    .map(|_| run_n_times(
+                        &a_buffer,
+                        &b_buffer,
+                        mat_size,
+                        &compiled_shader,
+                        &dev,
+                        &queue,
+                        2,
+                        simd_size,
+                        tiled,
+                    )
+                    .unwrap()
+                    .1)
+                    .sum::<f32>()
+                    / trials as f32
+            );
+            println!(
+                "5: {}ms",
+                (0..trials)
+                    .map(|_| run_n_times(
+                        &a_buffer,
+                        &b_buffer,
+                        mat_size,
+                        &compiled_shader,
+                        &dev,
+                        &queue,
+                        5,
+                        simd_size,
+                        tiled,
+                    )
+                    .unwrap()
+                    .1)
+                    .sum::<f32>()
+                    / trials as f32
+            );
             // println!(
             //     "10: {}ms",
             //     (0..trials)
@@ -350,7 +292,7 @@ fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineS
 
 fn assert_close(a: &[f32], b: &[f32]) {
     assert_eq!(a.len(), b.len());
-    for (i, (a, b)) in a.iter().zip(b.iter()).enumerate() {
-        assert!((a - b).abs() < 1e-3, "{a} : {b}\ni: {i}",);
+    for (a, b) in a.iter().zip(b.iter()) {
+        assert!((a - b).abs() < 1e-3);
     }
 }
