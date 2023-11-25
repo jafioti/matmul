@@ -2,19 +2,18 @@
 #include <metal_simdgroup_matrix>  // Available from Metal version 2.3 released with OS X 11.0+
 using namespace metal;
 
-#define LID 2
-
-kernel void gemm_reference(
+kernel void simple_simd(
      device float *a [[buffer(2)]],
      device const float *data1 [[buffer(0)]],
      device const float *data2 [[buffer(1)]],
      device uint& N [[buffer(4)]],
      uint3 gid [[threadgroup_position_in_grid]],
-     uint3 lid [[thread_position_in_threadgroup]]) {
+     uint3 global_id [[thread_position_in_grid]],
+     uint3 block_size [[threads_per_threadgroup]]) {
 
-  a += gid.x * 32 * N + (gid.y * LID + lid.y) * 32;
+  a += gid.x * 32 * N + global_id.y * 32;
   data1 += gid.x * 32 * N;
-  data2 += (gid.y * LID + lid.y) * 32;
+  data2 += global_id.y * 32;
 
   simdgroup_float8x8 acc[4][4];
   for (uint i = 0; i < 4; i++) {
@@ -31,12 +30,12 @@ kernel void gemm_reference(
     uint n8 = 8*N;
     #pragma unroll(4)
     for (int i = 0; i < 4; ++i) {
-        simdgroup_load(A[i], d1 + i * n8, N, ulong2(0, 0));
+        simdgroup_load(A[i], d1 + i * n8, N);
     }
     device const float *d2 = data2+k*N;
     #pragma unroll(4)
     for (int i = 0; i < 4; ++i) {
-        simdgroup_load(B[i], 8 * i + d2, N, ulong2(0, 0));
+        simdgroup_load(B[i], 8 * i + d2, N);
     }
 
     #pragma unroll(4)
@@ -52,7 +51,7 @@ kernel void gemm_reference(
   for (int i = 0; i < 4; ++i) {
     #pragma unroll(4)
     for (int j = 0; j < 4; ++j) {
-        simdgroup_store(acc[j][i], a+(8*j+8*i*N), N, ulong2(0, 0));
+        simdgroup_store(acc[j][i], a+(8*j+8*i*N), N);
     }
   }
 }

@@ -11,6 +11,7 @@ fn read_shader_from_file(file_path: &str) -> String {
         .unwrap_or_else(|_| panic!("Failed to read shader file {}", file_path))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_command_encoder(
     command_buffer: &CommandBufferRef,
     a_buffer: &Buffer,
@@ -20,7 +21,6 @@ fn setup_command_encoder(
     mat_size: usize,
     simd_size: u64,
     thread_block_size: u64,
-    tile_count: u64,
 ) {
     let encoder =
         command_buffer.compute_command_encoder_with_descriptor(ComputePassDescriptor::new());
@@ -40,27 +40,23 @@ fn setup_command_encoder(
     encoder.dispatch_threads(
         MTLSize {
             width: mat_size as u64,
-            height: mat_size as u64
-                / if tile_count == 1 {
-                    1
-                } else {
-                    simd_size * 2 * tile_count
-                },
+            height: if simd_size == 1 {
+                mat_size as u64
+            } else {
+                mat_size as u64 / (simd_size * 4)
+            },
             depth: 1,
         },
         MTLSize {
             width: thread_block_size,
-            height: if tile_count == 1 {
-                thread_block_size
-            } else {
-                tile_count
-            },
+            height: if simd_size == 1 { thread_block_size } else { 8 },
             depth: 1,
         },
     );
     encoder.end_encoding();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_n_times(
     a_buffer: &Buffer,
     b_buffer: &Buffer,
@@ -70,14 +66,12 @@ fn run_n_times(
     queue: &CommandQueue,
     n: usize,
     simd_size: u64,
-    tiled: bool,
 ) -> Option<(Vec<f32>, f32)> {
     autoreleasepool(|| {
         let c_buffer = copy_to_buffer(&vec![0.; mat_size * mat_size], dev);
         let command_buffer = queue.new_command_buffer();
 
         let thread_block_size = 32;
-        let tile_count = if tiled { 2 } else { 1 };
 
         for _ in 0..n {
             setup_command_encoder(
@@ -89,7 +83,6 @@ fn run_n_times(
                 mat_size,
                 simd_size,
                 thread_block_size,
-                tile_count,
             );
         }
 
@@ -127,20 +120,18 @@ fn main() {
         let b_buffer = copy_to_buffer(&b_data, &dev);
 
         let shaders = [
-            ("./src/shaders/naive.metal", "naive", false, 1),
-            ("./src/shaders/tiled.metal", "tiled", false, 1),
-            ("./src/shaders/prefetch.metal", "prefetch", false, 1),
-            ("./src/shaders/simd.metal", "simd", true, 8),
+            // ("./src/shaders/naive.metal", "naive", 1),
+            // ("./src/shaders/tiled.metal", "tiled", 1),
+            // ("./src/shaders/prefetch.metal", "prefetch", 1),
+            ("./src/shaders/simd.metal", "simple_simd", 8),
         ];
 
         let shader_source = read_shader_from_file("./src/shaders/naive.metal");
         let shader = compile_function("naive", &shader_source, &dev);
-        let reference = run_n_times(
-            &a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 1, 1, false,
-        )
-        .unwrap()
-        .0;
-        for (shader_path, name, tiled, simd_size) in shaders {
+        let reference = run_n_times(&a_buffer, &b_buffer, mat_size, &shader, &dev, &queue, 1, 1)
+            .unwrap()
+            .0;
+        for (shader_path, name, simd_size) in shaders {
             println!("{name}");
             let shader_source = read_shader_from_file(shader_path);
             let compiled_shader = compile_function(name, &shader_source, &dev);
@@ -153,7 +144,6 @@ fn main() {
                 &queue,
                 1,
                 simd_size,
-                tiled,
             )
             .unwrap()
             .0;
@@ -171,7 +161,6 @@ fn main() {
                         &queue,
                         1,
                         simd_size,
-                        tiled,
                     )
                     .unwrap()
                     .1)
@@ -190,7 +179,6 @@ fn main() {
                         &queue,
                         2,
                         simd_size,
-                        tiled,
                     )
                     .unwrap()
                     .1)
@@ -209,7 +197,6 @@ fn main() {
                         &queue,
                         5,
                         simd_size,
-                        tiled,
                     )
                     .unwrap()
                     .1)
