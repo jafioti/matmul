@@ -120,7 +120,7 @@ fn main() {
         let b_buffer = copy_to_buffer(&b_data, &dev);
 
         let shaders = [
-            // ("./src/shaders/naive.metal", "naive", 1),
+            ("./src/shaders/naive.metal", "naive", 1),
             // ("./src/shaders/tiled.metal", "tiled", 1),
             // ("./src/shaders/prefetch.metal", "prefetch", 1),
             ("./src/shaders/simd.metal", "simple_simd", 8),
