@@ -3,20 +3,23 @@
 using namespace metal;
 
 kernel void simple_simd(
-     device float *a [[buffer(2)]],
-     device const float *data1 [[buffer(0)]],
-     device const float *data2 [[buffer(1)]],
-     device uint& N [[buffer(4)]],
-     uint3 gid [[threadgroup_position_in_grid]],
-     uint3 global_id [[thread_position_in_grid]],
-     uint3 block_size [[threads_per_threadgroup]]) {
+    device float *a [[buffer(2)]],
+    device const float *data1 [[buffer(0)]],
+    device const float *data2 [[buffer(1)]],
+    device uint& N [[buffer(4)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint3 global_id [[thread_position_in_grid]],
+    uint3 block_size [[threads_per_threadgroup]]
+) {
 
   a += gid.x * 32 * N + global_id.y * 32;
   data1 += gid.x * 32 * N;
   data2 += global_id.y * 32;
 
   simdgroup_float8x8 acc[4][4];
+  #pragma unroll(4)
   for (uint i = 0; i < 4; i++) {
+    #pragma unroll(4)
     for (uint j = 0; j < 4; j++) {
       acc[i][j] = simdgroup_float8x8(0);
     }

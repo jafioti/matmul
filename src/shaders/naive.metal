@@ -8,15 +8,14 @@ kernel void naive(
     device uint& M [[buffer(3)]],
     device uint& N [[buffer(4)]],
     device uint& K [[buffer(5)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint3 global_pos [[thread_position_in_grid]],
-    uint3 block_size[[threads_per_threadgroup]]
+    uint3 global_pos [[thread_position_in_grid]]
 ) {
-    if (global_pos.y >= M || global_pos.x >= N) return;
-    float value = 0.0f;
-    uint pos_k = global_pos.y * K;
-    for (int i = 0; i < K; ++i) {
-        value = fast::fma(A[pos_k + i], B[i * N + global_pos.x], value);
+    if (global_pos.y < M || global_pos.x < N) {
+        float value = 0.0f;
+        uint pos_k = global_pos.y * K;
+        for (uint i = 0; i < K; ++i) {
+            value = fast::fma(A[pos_k + i], B[i * N + global_pos.x], value);
+        }
+        C[global_pos.y * N + global_pos.x] = value;
     }
-    C[global_pos.y * N + global_pos.x] = value;
 }
