@@ -33,11 +33,7 @@ fn setup_command_encoder(
     set_input_u32(encoder, mat_size as u32, 3);
     set_input_u32(encoder, mat_size as u32, 4);
     set_input_u32(encoder, mat_size as u32, 5);
-    encoder.set_threadgroup_memory_length(
-        0,
-        threadgroup_memory,
-        // 4 * thread_block_size * thread_block_size * std::mem::size_of::<f32>() as u64,
-    );
+    encoder.set_threadgroup_memory_length(0, threadgroup_memory);
     encoder.dispatch_thread_groups(threadgroups_per_grid, threads_per_threadgroup);
     encoder.end_encoding();
 }
@@ -89,7 +85,6 @@ fn run_n_times(
 fn main() {
     autoreleasepool(|| {
         let mat_size = 4096;
-        let thread_block_size = 32;
         // let mat_size = 16;
         let trials = 10;
         let mut rng = StdRng::seed_from_u64(0);
@@ -105,18 +100,19 @@ fn main() {
         let a_buffer = copy_to_buffer(&a_data, &dev);
         let b_buffer = copy_to_buffer(&b_data, &dev);
 
+        let naive_thread_block_size = 8;
         let shaders = [
             (
                 "./src/shaders/naive.metal",
                 "naive",
                 MTLSize {
-                    width: mat_size as u64 / thread_block_size,
-                    height: mat_size as u64 / thread_block_size,
+                    width: mat_size as u64 / naive_thread_block_size,
+                    height: mat_size as u64 / naive_thread_block_size,
                     depth: 1,
                 },
                 MTLSize {
-                    width: thread_block_size,
-                    height: thread_block_size,
+                    width: naive_thread_block_size,
+                    height: naive_thread_block_size,
                     depth: 1,
                 },
                 0,
@@ -125,42 +121,42 @@ fn main() {
                 "./src/shaders/tiled.metal",
                 "tiled",
                 MTLSize {
-                    width: mat_size as u64 / thread_block_size,
-                    height: mat_size as u64 / thread_block_size,
+                    width: mat_size as u64 / naive_thread_block_size,
+                    height: mat_size as u64 / naive_thread_block_size,
                     depth: 1,
                 },
                 MTLSize {
-                    width: thread_block_size,
-                    height: thread_block_size,
+                    width: naive_thread_block_size,
+                    height: naive_thread_block_size,
                     depth: 1,
                 },
-                thread_block_size * thread_block_size * 4 * size_of::<f32>() as u64,
+                naive_thread_block_size * naive_thread_block_size * 4 * size_of::<f32>() as u64,
             ),
             (
                 "./src/shaders/prefetch.metal",
                 "prefetch",
                 MTLSize {
-                    width: mat_size as u64 / thread_block_size,
-                    height: mat_size as u64 / thread_block_size,
+                    width: mat_size as u64 / naive_thread_block_size,
+                    height: mat_size as u64 / naive_thread_block_size,
                     depth: 1,
                 },
                 MTLSize {
-                    width: thread_block_size,
-                    height: thread_block_size,
+                    width: naive_thread_block_size,
+                    height: naive_thread_block_size,
                     depth: 1,
                 },
-                thread_block_size * thread_block_size * 4 * size_of::<f32>() as u64,
+                naive_thread_block_size * naive_thread_block_size * 4 * size_of::<f32>() as u64,
             ),
             (
                 "./src/shaders/simd.metal",
                 "simple_simd",
                 MTLSize {
-                    width: mat_size as u64 / thread_block_size,
+                    width: mat_size as u64 / 32,
                     height: mat_size as u64 / (32 * 8),
                     depth: 1,
                 },
                 MTLSize {
-                    width: thread_block_size,
+                    width: 32,
                     height: 8,
                     depth: 1,
                 },
@@ -179,13 +175,13 @@ fn main() {
             &queue,
             1,
             MTLSize {
-                width: mat_size as u64 / thread_block_size,
-                height: mat_size as u64 / thread_block_size,
+                width: mat_size as u64 / naive_thread_block_size,
+                height: mat_size as u64 / naive_thread_block_size,
                 depth: 1,
             },
             MTLSize {
-                width: thread_block_size,
-                height: thread_block_size,
+                width: naive_thread_block_size,
+                height: naive_thread_block_size,
                 depth: 1,
             },
             0,
@@ -217,7 +213,6 @@ fn main() {
             )
             .unwrap()
             .0;
-            println!("Res: {:?}", &res[res.len() - 10..]);
 
             assert_close(&res, &reference);
             println!(
