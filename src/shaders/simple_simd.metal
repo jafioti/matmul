@@ -11,26 +11,25 @@ kernel void simple_simd(
     uint3 global_id [[thread_position_in_grid]],
     uint3 block_size [[threads_per_threadgroup]]
 ) {
-
   a += gid.x * 32 * N + global_id.y * 32;
   data1 += gid.x * 32 * N;
   data2 += global_id.y * 32;
 
   simdgroup_float8x8 acc[4][4];
   #pragma unroll(4)
-  for (uint i = 0; i < 4; i++) {
+  for (uint i = 0; i < 4; ++i) {
     #pragma unroll(4)
-    for (uint j = 0; j < 4; j++) {
+    for (uint j = 0; j < 4; ++j) {
       acc[i][j] = simdgroup_float8x8(0);
     }
   }
 
   simdgroup_float8x8 A[4];
   simdgroup_float8x8 B[4];
+  uint n8 = 8*N;
   for (uint k = 0; k < N; k+=8) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const float *d1 = data1+k;
-    uint n8 = 8*N;
     #pragma unroll(4)
     for (int i = 0; i < 4; ++i) {
         simdgroup_load(A[i], d1 + i * n8, N);
@@ -52,9 +51,10 @@ kernel void simple_simd(
 
   #pragma unroll(4)
   for (int i = 0; i < 4; ++i) {
+    uint n8i = i * n8;
     #pragma unroll(4)
     for (int j = 0; j < 4; ++j) {
-        simdgroup_store(acc[j][i], a+(8*j+8*i*N), N);
+        simdgroup_store(acc[j][i], a+(8*j+n8i), N);
     }
   }
 }

@@ -148,7 +148,7 @@ fn main() {
                 naive_thread_block_size * naive_thread_block_size * 4 * size_of::<f32>() as u64,
             ),
             (
-                "./src/shaders/simd.metal",
+                "./src/shaders/simple_simd.metal",
                 "simple_simd",
                 MTLSize {
                     width: mat_size as u64 / 32,
@@ -162,6 +162,21 @@ fn main() {
                 },
                 0,
             ),
+            // (
+            //     "./src/shaders/tiled_simd.metal",
+            //     "tiled_simd",
+            //     MTLSize {
+            //         width: mat_size as u64 / 32,
+            //         height: mat_size as u64 / (32 * 8),
+            //         depth: 1,
+            //     },
+            //     MTLSize {
+            //         width: 32,
+            //         height: 8,
+            //         depth: 1,
+            //     },
+            //     0,
+            // ),
         ];
 
         let shader_source = read_shader_from_file("./src/shaders/naive.metal");
