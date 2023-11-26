@@ -6,13 +6,15 @@ kernel void simple_simd(
     device float *a [[buffer(2)]],
     device const float *data1 [[buffer(0)]],
     device const float *data2 [[buffer(1)]],
+    device uint& M [[buffer(3)]],
     device uint& N [[buffer(4)]],
+    device uint& K [[buffer(5)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint3 global_id [[thread_position_in_grid]],
     uint3 block_size [[threads_per_threadgroup]]
 ) {
   a += gid.x * 32 * N + global_id.y * 32;
-  data1 += gid.x * 32 * N;
+  data1 += gid.x * 32 * K;
   data2 += global_id.y * 32;
 
   simdgroup_float8x8 acc[4][4];
@@ -26,13 +28,13 @@ kernel void simple_simd(
 
   simdgroup_float8x8 A[4];
   simdgroup_float8x8 B[4];
-  uint n8 = 8*N;
-  for (uint k = 0; k < N; k+=8) {
+  uint k8 = 8*K;
+  for (uint k = 0; k < K; k+=8) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const float *d1 = data1+k;
     #pragma unroll(4)
     for (int i = 0; i < 4; ++i) {
-        simdgroup_load(A[i], d1 + i * n8, N);
+        simdgroup_load(A[i], d1 + i * k8, K);
     }
     device const float *d2 = data2+k*N;
     #pragma unroll(4)
@@ -51,7 +53,7 @@ kernel void simple_simd(
 
   #pragma unroll(4)
   for (int i = 0; i < 4; ++i) {
-    uint n8i = i * n8;
+    uint n8i = i * 8 * N;
     #pragma unroll(4)
     for (int j = 0; j < 4; ++j) {
         simdgroup_store(acc[j][i], a+(8*j+n8i), N);

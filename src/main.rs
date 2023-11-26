@@ -20,7 +20,9 @@ fn setup_command_encoder(
     shader: &ComputePipelineState,
     threadgroups_per_grid: MTLSize,
     threads_per_threadgroup: MTLSize,
-    mat_size: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     threadgroup_memory: u64,
 ) {
     let encoder =
@@ -30,9 +32,9 @@ fn setup_command_encoder(
     encoder.set_buffer(0, Some(a_buffer), 0);
     encoder.set_buffer(1, Some(b_buffer), 0);
     encoder.set_buffer(2, Some(c_buffer), 0);
-    set_input_u32(encoder, mat_size as u32, 3);
-    set_input_u32(encoder, mat_size as u32, 4);
-    set_input_u32(encoder, mat_size as u32, 5);
+    set_input_u32(encoder, m as u32, 3);
+    set_input_u32(encoder, n as u32, 4);
+    set_input_u32(encoder, k as u32, 5);
     encoder.set_threadgroup_memory_length(0, threadgroup_memory);
     encoder.dispatch_thread_groups(threadgroups_per_grid, threads_per_threadgroup);
     encoder.end_encoding();
@@ -42,20 +44,22 @@ fn setup_command_encoder(
 fn run_n_times(
     a_buffer: &Buffer,
     b_buffer: &Buffer,
-    mat_size: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     shader: &ComputePipelineState,
     dev: &Device,
     queue: &CommandQueue,
-    n: usize,
+    run_times: usize,
     threadgroups_per_grid: MTLSize,
     threads_per_threadgroup: MTLSize,
     threadgroup_memory: u64,
 ) -> Option<(Vec<f32>, f32)> {
     autoreleasepool(|| {
-        let c_buffer = copy_to_buffer(&vec![0.; mat_size * mat_size], dev);
+        let c_buffer = copy_to_buffer(&vec![0.; m * n], dev);
         let command_buffer = queue.new_command_buffer();
 
-        for _ in 0..n {
+        for _ in 0..run_times {
             setup_command_encoder(
                 command_buffer,
                 a_buffer,
@@ -64,7 +68,9 @@ fn run_n_times(
                 shader,
                 threadgroups_per_grid,
                 threads_per_threadgroup,
-                mat_size,
+                m,
+                k,
+                n,
                 threadgroup_memory,
             );
         }
@@ -77,37 +83,37 @@ fn run_n_times(
             MTLCommandBufferStatus::Completed => {
                 Some((copy_from_buffer(&c_buffer), micros as f32 / 1_000.))
             }
-            _ => None,
+            _ => {
+                println!("Status: {:?}", command_buffer.status());
+                None
+            }
         }
     })
 }
 
 fn main() {
     autoreleasepool(|| {
-        let mat_size = 4096;
-        // let mat_size = 16;
+        let m = 4096;
+        let k = 1024;
+        let n = 2048;
+        let naive_thread_block_size = 16;
         let trials = 10;
         let mut rng = StdRng::seed_from_u64(0);
-        let a_data: Vec<f32> = (0..(mat_size * mat_size))
-            .map(|_| rng.gen_range(-0.5..0.5))
-            .collect();
-        let b_data: Vec<f32> = (0..(mat_size * mat_size))
-            .map(|_| rng.gen_range(-0.5..0.5))
-            .collect();
+        let a_data: Vec<f32> = (0..(m * k)).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let b_data: Vec<f32> = (0..(k * n)).map(|_| rng.gen_range(-0.5..0.5)).collect();
 
         let dev = Device::system_default().unwrap();
         let queue = dev.new_command_queue();
         let a_buffer = copy_to_buffer(&a_data, &dev);
         let b_buffer = copy_to_buffer(&b_data, &dev);
 
-        let naive_thread_block_size = 8;
         let shaders = [
             (
                 "./src/shaders/naive.metal",
                 "naive",
                 MTLSize {
-                    width: mat_size as u64 / naive_thread_block_size,
-                    height: mat_size as u64 / naive_thread_block_size,
+                    width: (m as u64).div_ceil(naive_thread_block_size),
+                    height: (n as u64).div_ceil(naive_thread_block_size),
                     depth: 1,
                 },
                 MTLSize {
@@ -121,8 +127,8 @@ fn main() {
                 "./src/shaders/tiled.metal",
                 "tiled",
                 MTLSize {
-                    width: mat_size as u64 / naive_thread_block_size,
-                    height: mat_size as u64 / naive_thread_block_size,
+                    width: (m as u64).div_ceil(naive_thread_block_size),
+                    height: (n as u64).div_ceil(naive_thread_block_size),
                     depth: 1,
                 },
                 MTLSize {
@@ -136,8 +142,8 @@ fn main() {
                 "./src/shaders/prefetch.metal",
                 "prefetch",
                 MTLSize {
-                    width: mat_size as u64 / naive_thread_block_size,
-                    height: mat_size as u64 / naive_thread_block_size,
+                    width: (m as u64).div_ceil(naive_thread_block_size),
+                    height: (n as u64).div_ceil(naive_thread_block_size),
                     depth: 1,
                 },
                 MTLSize {
@@ -151,8 +157,8 @@ fn main() {
                 "./src/shaders/simple_simd.metal",
                 "simple_simd",
                 MTLSize {
-                    width: mat_size as u64 / 32,
-                    height: mat_size as u64 / (32 * 8),
+                    width: (m as u64).div_ceil(32),
+                    height: (n as u64).div_ceil(32 * 8),
                     depth: 1,
                 },
                 MTLSize {
@@ -162,36 +168,24 @@ fn main() {
                 },
                 0,
             ),
-            // (
-            //     "./src/shaders/tiled_simd.metal",
-            //     "tiled_simd",
-            //     MTLSize {
-            //         width: mat_size as u64 / 32,
-            //         height: mat_size as u64 / (32 * 8),
-            //         depth: 1,
-            //     },
-            //     MTLSize {
-            //         width: 32,
-            //         height: 8,
-            //         depth: 1,
-            //     },
-            //     0,
-            // ),
         ];
 
+        // let reference = matmul(&a_data, &b_data, m, n, k);
         let shader_source = read_shader_from_file("./src/shaders/naive.metal");
         let shader = compile_function("naive", &shader_source, &dev);
         let reference = run_n_times(
             &a_buffer,
             &b_buffer,
-            mat_size,
+            m,
+            k,
+            n,
             &shader,
             &dev,
             &queue,
             1,
             MTLSize {
-                width: mat_size as u64 / naive_thread_block_size,
-                height: mat_size as u64 / naive_thread_block_size,
+                width: m as u64 / naive_thread_block_size,
+                height: n as u64 / naive_thread_block_size,
                 depth: 1,
             },
             MTLSize {
@@ -217,7 +211,9 @@ fn main() {
             let res = run_n_times(
                 &a_buffer,
                 &b_buffer,
-                mat_size,
+                m,
+                k,
+                n,
                 &compiled_shader,
                 &dev,
                 &queue,
@@ -228,6 +224,7 @@ fn main() {
             )
             .unwrap()
             .0;
+            println!("Res: {:?}", &res[..10]);
 
             assert_close(&res, &reference);
             println!(
@@ -236,7 +233,9 @@ fn main() {
                     .map(|_| run_n_times(
                         &a_buffer,
                         &b_buffer,
-                        mat_size,
+                        m,
+                        k,
+                        n,
                         &compiled_shader,
                         &dev,
                         &queue,
@@ -365,6 +364,27 @@ fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineS
 fn assert_close(a: &[f32], b: &[f32]) {
     assert_eq!(a.len(), b.len());
     for (i, (a, b)) in a.iter().zip(b.iter()).enumerate() {
-        assert!((a - b).abs() < 1e-3, "{i}");
+        assert!((a - b).abs() < 1e-3, "Mismatch on index {i}");
     }
+}
+
+#[allow(unused)]
+fn matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    if a.len() != m * k || b.len() != k * n {
+        panic!("Invalid matrix dimensions for multiplication");
+    }
+
+    let mut result = vec![0.0; m * n];
+
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0;
+            for i in 0..k {
+                sum += a[row * k + i] * b[i * n + col];
+            }
+            result[row * n + col] = sum;
+        }
+    }
+
+    result
 }
