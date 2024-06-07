@@ -1,0 +1,9 @@
+[package]
+name = "matrixmultiply"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metal = "0.28.0"
+rand = "0.8.5"
+matrixmultiply = "0.3.8"
