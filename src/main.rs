@@ -12,7 +12,7 @@ const M: u64 = 4096;
 const N: u64 = 4096;
 const K: u64 = 4096;
 
-const TRIALS: usize = 10;
+const TRIALS: usize = 5;
 
 fn main() {
     autoreleasepool(|| {
