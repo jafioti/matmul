@@ -7,6 +7,7 @@ use metal::{
 use rand::Rng;
 
 mod utils;
+use crate::utils::SetInt;
 
 const M: u64 = 4096;
 const N: u64 = 4096;
@@ -89,6 +90,19 @@ fn main() {
                 ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64
             )
         );
+        println!(
+            "SIMD: {} ms",
+            time_kernel(
+                SIMD,
+                (N / 32, N / 256, 1),
+                (32, 8, 1),
+                &a_buf,
+                &b_buf,
+                &c,
+                &[],
+                0
+            )
+        );
     })
 }
 
@@ -155,11 +169,11 @@ fn run_kernel(
     encoder.set_buffer(0, Some(a_buf), 0);
     encoder.set_buffer(1, Some(b_buf), 0);
     encoder.set_buffer(2, Some(c_buf), 0);
-    encoder.set_bytes(3, 4, &(M as u32) as *const u32 as *const _);
-    encoder.set_bytes(4, 4, &(K as u32) as *const u32 as *const _);
-    encoder.set_bytes(5, 4, &(N as u32) as *const u32 as *const _);
+    encoder.set_u32(3, M as u32);
+    encoder.set_u32(4, K as u32);
+    encoder.set_u32(5, N as u32);
     for (i, inp) in other_inps.iter().enumerate() {
-        encoder.set_bytes(6 + i as u64, 4, inp as *const u32 as *const _);
+        encoder.set_u32(6 + i, *inp);
     }
     encoder.set_threadgroup_memory_length(0, shared_mem);
 
@@ -173,6 +187,7 @@ fn run_kernel(
     command_buffer.wait_until_completed();
 }
 
+// Super straightforward matmul
 const NAIVE: &str = "
 #include <metal_stdlib>
 using namespace metal;
@@ -449,6 +464,76 @@ kernel void matmul(
         #pragma unroll(TN)
         for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
             C[(thread_row * TM + resIdxM) * N + thread_col * TN + resIdxN] = tmp[resIdxM * TN + resIdxN];
+        }
+    }
+}
+";
+
+const SIMD: &str = "
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+#include <metal_simdgroup>
+using namespace metal;
+
+kernel void matmul(
+    device const float *A [[buffer(0)]],
+    device const float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    device uint& M [[buffer(3)]],
+    device uint& K [[buffer(4)]],
+    device uint& N [[buffer(5)]],
+    uint3 block_pos [[threadgroup_position_in_grid]],
+    uint3 global_pos [[thread_position_in_grid]]
+) {
+    // Step pointers
+    A += block_pos.x * 32 * K;
+    B += global_pos.y * 32;
+    C += block_pos.x * 32 * N + global_pos.y * 32;
+
+    // Initialize accumulating simdgroup matricies
+    simdgroup_float8x8 acc[4][4];
+    #pragma unroll(4)
+    for (uint i = 0; i < 4; ++i) {
+        #pragma unroll(4)
+        for (uint j = 0; j < 4; ++j) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+
+    // Initialize simdgroup source matricies
+    simdgroup_float8x8 simdA[4];
+    simdgroup_float8x8 simdB[4];
+
+    // K loop
+    for (uint k = 0; k < K; k+=8) {
+        threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
+
+        // Load sources into simdgroup matricies
+        #pragma unroll(4)
+        for (int i = 0; i < 4; ++i) {
+            simdgroup_load(simdA[i], A + k + i * K * 8, K);
+            simdgroup_load(simdB[i], B + k * N + i * 8, N);
+        }
+
+        // Do matmul
+        #pragma unroll(4)
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll(4)
+            for (int j = 0; j < 4; ++j) {
+                simdgroup_multiply_accumulate(acc[i][j], simdA[j], simdB[i], acc[i][j]);
+            }
+        }
+    }
+
+    // Save results
+    #pragma unroll(4)
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll(4)
+        for (int j = 0; j < 4; ++j) {
+            simdgroup_store(acc[j][i], C + j * 8 + i * N * 8, N);
         }
     }
 }
