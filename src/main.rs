@@ -65,7 +65,7 @@ fn main() {
             )
         );
         println!(
-            "Register 1D Tiled: {} ms",
+            "1D Register Tiled: {} ms",
             time_kernel(
                 include_str!("kernels/3_1D_register_tile.metal"),
                 (N / 64, M / 64, 1),
@@ -78,7 +78,7 @@ fn main() {
             )
         );
         println!(
-            "Register 2D Tiled: {} ms",
+            "2D Register Tiled: {} ms",
             time_kernel(
                 include_str!("kernels/4_2D_register_tile.metal"),
                 (N / 64, M / 64, 1),
@@ -104,7 +104,7 @@ fn main() {
             )
         );
         println!(
-            "SIMD 2: {} ms",
+            "2D SIMD: {} ms",
             time_kernel(
                 include_str!("kernels/6_2D_simd.metal"),
                 (N / 32, N / 256, 1),
