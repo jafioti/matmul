@@ -13,7 +13,7 @@ const M: u64 = 4096;
 const N: u64 = 4096;
 const K: u64 = 4096;
 
-const TRIALS: usize = 1;
+const TRIALS: usize = 5;
 
 fn main() {
     autoreleasepool(|| {
@@ -28,7 +28,7 @@ fn main() {
         println!(
             "Naive: {} ms",
             time_kernel(
-                NAIVE,
+                include_str!("kernels/0_naive.metal"),
                 (M / 32, N / 32, 1),
                 (32, 32, 1),
                 &a_buf,
@@ -41,7 +41,7 @@ fn main() {
         println!(
             "Warp Coalesced: {} ms",
             time_kernel(
-                WARP_COALESCED,
+                include_str!("kernels/1_warp_coalesced.metal"),
                 (M / 32, N / 32, 1),
                 (32 * 32, 1, 1),
                 &a_buf,
@@ -54,7 +54,7 @@ fn main() {
         println!(
             "SMEM Tiled: {} ms",
             time_kernel(
-                SMEM_TILED,
+                include_str!("kernels/2_smem_tiled.metal"),
                 (M / 32, N / 32, 1),
                 (32 * 32, 1, 1),
                 &a_buf,
@@ -67,7 +67,7 @@ fn main() {
         println!(
             "Register 1D Tiled: {} ms",
             time_kernel(
-                REGISTER_1D_TILE,
+                include_str!("kernels/3_1D_register_tile.metal"),
                 (N / 64, M / 64, 1),
                 ((64 * 64) / 8, 1, 1),
                 &a_buf,
@@ -80,7 +80,7 @@ fn main() {
         println!(
             "Register 2D Tiled: {} ms",
             time_kernel(
-                REGISTER_2D_TILE,
+                include_str!("kernels/4_2D_register_tile.metal"),
                 (N / 64, M / 64, 1),
                 ((64 * 64) / (8 * 8), 1, 1),
                 &a_buf,
@@ -93,7 +93,7 @@ fn main() {
         println!(
             "SIMD: {} ms",
             time_kernel(
-                SIMD,
+                include_str!("kernels/5_simd.metal"),
                 (N / 32, N / 256, 1),
                 (32, 8, 1),
                 &a_buf,
@@ -106,7 +106,7 @@ fn main() {
         println!(
             "SIMD 2: {} ms",
             time_kernel(
-                SIMD_2,
+                include_str!("kernels/6_2D_simd.metal"),
                 (N / 32, N / 256, 1),
                 (32, 8, 1),
                 &a_buf,
@@ -119,7 +119,7 @@ fn main() {
         println!(
             "SIMD Prefetch: {} ms",
             time_kernel(
-                SIMD_PREFETCH,
+                include_str!("kernels/7_simd_prefetch.metal"),
                 (N / 32, N / 256, 1),
                 (32, 8, 1),
                 &a_buf,
@@ -127,6 +127,19 @@ fn main() {
                 &c,
                 &[],
                 8 * 8 * 4 * 2 * 8 * 4 // height x width x num tiles x 2 inputs x 8 simdgroups per threadgroup
+            )
+        );
+        println!(
+            "MLX: {} ms",
+            time_kernel(
+                include_str!("kernels/8_mlx.metal"),
+                (N / 32, M / 32, 1),
+                (32, 2, 2),
+                &a_buf,
+                &b_buf,
+                &c,
+                &[0, 0, 0, 0],
+                0,
             )
         );
     })
@@ -212,536 +225,3 @@ fn run_kernel(
     command_buffer.commit();
     command_buffer.wait_until_completed();
 }
-
-/// Super straightforward matmul
-const NAIVE: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void matmul(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    uint2 tid [[thread_position_in_grid]]
-) {
-    uint row = tid.x;
-    uint column = tid.y;
-
-    if(row < M && column < N) {
-        float value = 0.0f;
-        for(int i = 0; i < K; ++i) {
-            value += A[row * K + i] * B[i * N + column];
-        }
-        C[row * N + column] = value;
-    }
-}
-";
-
-/// Access memory such that each warp accesses contiguous memory
-/// Each warp writes to a row in C
-const WARP_COALESCED: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void matmul(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    device uint& BLOCK_SIZE [[buffer(6)]],
-    uint2 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint2 threadgroup_position_in_grid [[threadgroup_position_in_grid]]
-) {
-    uint row = threadgroup_position_in_grid.x * BLOCK_SIZE + (thread_position_in_threadgroup.x / BLOCK_SIZE);
-    uint column = threadgroup_position_in_grid.y * BLOCK_SIZE + (thread_position_in_threadgroup.x % BLOCK_SIZE);
-
-    if(row < M && column < N) {
-        float value = 0.0f;
-        for(int i = 0; i < K; ++i) {
-            value += A[row * K + i] * B[i * N + column];
-        }
-        C[row * N + column] = value;
-    }
-}
-";
-
-/// Load tiles of memory into shared memory to reduce access latency in inner loop
-const SMEM_TILED: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void matmul(
-    device float* A [[buffer(0)]],
-    device float* B [[buffer(1)]],
-    device float* C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    device uint& BLOCK_SIZE [[buffer(6)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint2 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint2 threadgroup_position_in_grid [[threadgroup_position_in_grid]]
-) {
-    uint thread_row = thread_position_in_threadgroup.x / BLOCK_SIZE;
-    uint thread_col = thread_position_in_threadgroup.x % BLOCK_SIZE;
-    uint row = threadgroup_position_in_grid.x;
-    uint column = threadgroup_position_in_grid.y;
-
-    // Advance pointers to starting points
-    A += row * BLOCK_SIZE * K;
-    B += column * BLOCK_SIZE;
-    C += row * BLOCK_SIZE * N + column * BLOCK_SIZE;
-
-    float tmp = 0.0;
-
-    // Setup shared memory pointers
-    threadgroup float* As = shared_memory;
-    threadgroup float* Bs = shared_memory + (BLOCK_SIZE * BLOCK_SIZE);
-
-    // Tile loop
-    for (int tileIndex = 0; tileIndex < K; tileIndex += BLOCK_SIZE) {
-        // Load tile into shared memory
-        As[thread_row * BLOCK_SIZE + thread_col] = A[thread_row * K + thread_col];
-        Bs[thread_row * BLOCK_SIZE + thread_col] = B[thread_row * N + thread_col];
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Advance pointers to next tile
-        A += BLOCK_SIZE;
-        B += BLOCK_SIZE * N;
-
-        // Do matmul on SMEM block
-        for (int i = 0; i < BLOCK_SIZE; ++i) {
-            tmp += As[thread_row * BLOCK_SIZE + i] * Bs[i * BLOCK_SIZE + thread_col];
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    C[thread_row * N + thread_col] = tmp;
-}
-";
-
-/// Output a 1D vector of TM elements per thread
-const REGISTER_1D_TILE: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void matmul(
-    device float* A [[buffer(0)]],
-    device float* B [[buffer(1)]],
-    device float* C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    device uint& BM [[buffer(6)]],
-    device uint& BN [[buffer(7)]],
-    device uint& BK [[buffer(8)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint2 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint2 threadgroup_position_in_grid [[threadgroup_position_in_grid]]
-) {
-    uint row = threadgroup_position_in_grid.y;
-    uint column = threadgroup_position_in_grid.x;
-    uint thread_row = thread_position_in_threadgroup.x / BN;
-    uint thread_col = thread_position_in_threadgroup.x % BN;
-
-    // Advance pointers to starting points
-    A += row * BM * K;
-    B += column * BN;
-    C += row * BM * N + column * BN;
-
-    const uint TM = 8;
-    float tmp[TM] = {0.0};
-
-    // Setup shared memory pointers
-    threadgroup float* As = shared_memory;
-    threadgroup float* Bs = shared_memory + (BM * BK);
-
-    // warp-level GMEM coalescing
-    uint innerColA = thread_position_in_threadgroup.x % BK;
-    uint innerRowA = thread_position_in_threadgroup.x / BK;
-    uint innerColB = thread_col;
-    uint innerRowB = thread_row;
-
-    // Tile loop
-    for (int tileIndex = 0; tileIndex < K; tileIndex += BK) {
-        // Load tile into shared memory
-        As[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
-        Bs[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Advance pointers to next tile
-        A += BK;
-        B += BK * N;
-
-        // Do matmul on SMEM block
-        for (int i = 0; i < BK; ++i) {
-            float tmpB = Bs[i * BN + thread_col];
-            #pragma unroll(TM)
-            for (int resIdx = 0; resIdx < TM; ++resIdx) {
-                tmp[resIdx] += As[(thread_row * TM + resIdx) * BK + i] * tmpB;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (int i = 0; i < TM; ++i) {
-        C[(thread_row * TM + i) * N + thread_col] = tmp[i];
-    }
-}
-";
-
-/// Output a 2D matrix of TMxTN elements per thread
-const REGISTER_2D_TILE: &str = "
-#include <metal_stdlib>
-using namespace metal;
-
-#define TM 8
-#define TN 8
-
-kernel void matmul(
-    device float* A [[buffer(0)]],
-    device float* B [[buffer(1)]],
-    device float* C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    device uint& BM [[buffer(6)]],
-    device uint& BN [[buffer(7)]],
-    device uint& BK [[buffer(8)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint2 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint2 threads_per_threadgroup [[threads_per_threadgroup]],
-    uint2 threadgroup_position_in_grid [[threadgroup_position_in_grid]]
-) {
-    uint row = threadgroup_position_in_grid.y;
-    uint column = threadgroup_position_in_grid.x;
-
-    uint thread_row = thread_position_in_threadgroup.x / (BN / TN);
-    uint thread_col = thread_position_in_threadgroup.x % (BN / TN);
-
-    // Setup shared memory pointers
-    threadgroup float* As = shared_memory;
-    threadgroup float* Bs = shared_memory + (BM * BK);
-
-    // Advance pointers to starting points
-    A += row * BM * K;
-    B += column * BN;
-    C += row * BM * N + column * BN;
-
-    // warp-level GMEM coalescing
-    uint innerColA = thread_position_in_threadgroup.x % BK;
-    uint innerRowA = thread_position_in_threadgroup.x / BK;
-    uint strideA = threads_per_threadgroup.x / BK;
-    uint innerColB = thread_position_in_threadgroup.x % BN;
-    uint innerRowB = thread_position_in_threadgroup.x / BN;
-    uint strideB = threads_per_threadgroup.x / BN;
-
-    float tmp[TM * TN] = {0.0};
-    float regM[TM] = {0.0};
-    float regN[TN] = {0.0};
-
-    // Tile loop
-    for (int tileIndex = 0; tileIndex < K; tileIndex += BK) {
-        // Load tile into shared memory
-        for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
-            As[(innerRowA + loadOffset) * BK + innerColA] =
-                A[(innerRowA + loadOffset) * K + innerColA];
-        }
-        for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
-            Bs[(innerRowB + loadOffset) * BN + innerColB] =
-                B[(innerRowB + loadOffset) * N + innerColB];
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Advance pointers to next tile
-        A += BK;
-        B += BK * N;
-
-        // Do matmul on SMEM block
-        for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
-            // block into registers
-            #pragma unroll(TM)
-            for (uint i = 0; i < TM; ++i) {
-                regM[i] = As[(thread_row * TM + i) * BK + dotIdx];
-            }
-            #pragma unroll(TN)
-            for (uint i = 0; i < TN; ++i) {
-                regN[i] = Bs[dotIdx * BN + thread_col * TN + i];
-            }
-            // dot products
-            #pragma unroll(TM)
-            for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-                #pragma unroll(TN)
-                for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-                    tmp[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
-                }
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    #pragma unroll(TM)
-    for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-        #pragma unroll(TN)
-        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-            C[(thread_row * TM + resIdxM) * N + thread_col * TN + resIdxN] = tmp[resIdxM * TN + resIdxN];
-        }
-    }
-}
-";
-
-/// We load a vector of 4 8x8 input matricies for each input.
-/// Accumulate into a 4x4 matrix of 8x8 accumulators.
-/// This utilizes metal's special simdgroup_multiply_accumulate hardware.
-const SIMD: &str = "
-#include <metal_stdlib>
-#include <metal_simdgroup_matrix>
-#include <metal_simdgroup>
-using namespace metal;
-
-kernel void matmul(
-    device const float *A [[buffer(0)]],
-    device const float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    uint3 block_pos [[threadgroup_position_in_grid]],
-    uint3 block_size [[threads_per_threadgroup]],
-    uint3 global_pos [[thread_position_in_grid]]
-) {
-    // Step pointers
-    A += block_pos.x * block_size.x * K;
-    B += global_pos.y * 32;
-    C += block_pos.x * 32 * N + global_pos.y * 32;
-
-    // Initialize accumulating simdgroup matricies
-    simdgroup_float8x8 acc[4][4];
-    #pragma unroll(4)
-    for (uint i = 0; i < 4; ++i) {
-        #pragma unroll(4)
-        for (uint j = 0; j < 4; ++j) {
-            acc[i][j] = simdgroup_float8x8(0);
-        }
-    }
-
-    // Initialize simdgroup source matricies
-    simdgroup_float8x8 simdA[4];
-    simdgroup_float8x8 simdB[4];
-
-    // K loop
-    for (uint k = 0; k < K; k+=8) {
-        threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
-
-        // Load sources into simdgroup matricies
-        #pragma unroll(4)
-        for (int i = 0; i < 4; ++i) {
-            simdgroup_load(simdA[i], A + (i * 8 * K) + k, K); // K is row width, loop down
-            simdgroup_load(simdB[i], B + (k * N) + (i * 8), N); // N is row width, loop right
-        }
-
-        // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
-        #pragma unroll(4)
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll(4)
-            for (int j = 0; j < 4; ++j) {
-                simdgroup_multiply_accumulate(acc[i][j], simdA[j], simdB[i], acc[i][j]);
-            }
-        }
-    }
-
-    // Save results
-    #pragma unroll(4)
-    for (int i = 0; i < 4; ++i) {
-        #pragma unroll(4)
-        for (int j = 0; j < 4; ++j) {
-            simdgroup_store(acc[j][i], C + (i * 8 * N) + (j * 8), N);
-        }
-    }
-}
-";
-
-/// We do the same thing as SIMD but instead use a matrix of 4x4 input matricies, rather than a vector of input matricies
-const SIMD_2: &str = "
-#include <metal_stdlib>
-#include <metal_simdgroup_matrix>
-#include <metal_simdgroup>
-using namespace metal;
-
-kernel void matmul(
-    device const float *A [[buffer(0)]],
-    device const float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    uint3 block_pos [[threadgroup_position_in_grid]],
-    uint3 block_size [[threads_per_threadgroup]],
-    uint3 global_pos [[thread_position_in_grid]]
-) {
-    // Step pointers
-    A += block_pos.x * block_size.x * K;
-    B += global_pos.y * 32;
-    C += block_pos.x * 32 * N + global_pos.y * 32;
-
-    // Initialize accumulating simdgroup matricies
-    simdgroup_float8x8 acc[4][4];
-    #pragma unroll(4)
-    for (uint i = 0; i < 4; ++i) {
-        #pragma unroll(4)
-        for (uint j = 0; j < 4; ++j) {
-            acc[i][j] = simdgroup_float8x8(0);
-        }
-    }
-
-    // Initialize simdgroup source matricies
-    simdgroup_float8x8 simdA[4][4];
-    simdgroup_float8x8 simdB[4][4];
-
-    // K loop
-    for (uint k = 0; k < K; k += 32) {
-        threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
-
-        // Load sources into simdgroup matricies
-        #pragma unroll(4)
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll(4)
-            for (int j = 0; j < 4; ++j) {
-                simdgroup_load(simdA[i][j], A + (i * 8 * K) + k + j * 8, K); // K is row width, loop down
-                simdgroup_load(simdB[j][i], B + ((k + j * 8) * N) + (i * 8), N); // N is row width, loop right
-            }
-        }
-
-        // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
-        #pragma unroll(4)
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll(4)
-            for (int j = 0; j < 4; ++j) {
-                #pragma unroll(4)
-                for (int x = 0; x < 4; ++x) {
-                    simdgroup_multiply_accumulate(acc[i][j], simdA[j][x], simdB[x][i], acc[i][j]);
-                }
-            }
-        }
-    }
-
-    // Save results
-    #pragma unroll(4)
-    for (int i = 0; i < 4; ++i) {
-        #pragma unroll(4)
-        for (int j = 0; j < 4; ++j) {
-            simdgroup_store(acc[j][i], C + (i * 8 * N) + (j * 8), N);
-        }
-    }
-}
-";
-
-const SIMD_PREFETCH: &str = "
-#include <metal_stdlib>
-#include <metal_simdgroup_matrix>
-#include <metal_simdgroup>
-using namespace metal;
-
-kernel void matmul(
-    device const float *A [[buffer(0)]],
-    device const float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    threadgroup float* shared_memory [[threadgroup(0)]],
-    uint3 block_pos [[threadgroup_position_in_grid]],
-    uint3 block_size [[threads_per_threadgroup]],
-    uint3 global_pos [[thread_position_in_grid]],
-    uint3 local_pos [[thread_position_in_threadgroup]],
-    uint simdgroup_pos [[simdgroup_index_in_threadgroup]],
-    uint local_simdgroup_pos [[thread_index_in_simdgroup]]
-) {
-    // Step pointers
-    A += block_pos.x * block_size.x * K;
-    B += global_pos.y * 32;
-    C += block_pos.x * 32 * N + global_pos.y * 32;
-    threadgroup float* sharedA = shared_memory + 8 * 8 * 4 * 2 * simdgroup_pos; // width x height x num tiles x num inputs x simdgroup_pos
-    threadgroup float* sharedB = sharedA + 8 * 8 * 4; // height x width x num tiles
-
-    // Initialize accumulating simdgroup matricies
-    simdgroup_float8x8 acc[4][4];
-    #pragma unroll(4)
-    for (uint i = 0; i < 4; ++i) {
-        #pragma unroll(4)
-        for (uint j = 0; j < 4; ++j) {
-            acc[i][j] = simdgroup_float8x8(0);
-        }
-    }
-
-    // Initialize simdgroup source matricies
-    simdgroup_float8x8 simdA[4];
-    simdgroup_float8x8 simdB[4];
-
-    // Load initial sources into shared memory
-    #pragma unroll(4)
-    for (int i = 0; i < 4; ++i) {
-        // Load A into shared memory
-        uint shared_mem_loading_index = local_simdgroup_pos * 2;
-        sharedA[shared_mem_loading_index + 8 * 8 * i] = A[(i * 8 * K) + (shared_mem_loading_index / 8) * K + (shared_mem_loading_index % 8)];
-        sharedA[shared_mem_loading_index + 8 * 8 * i + 1] = A[(i * 8 * K) + ((shared_mem_loading_index + 1) / 8) * K + ((shared_mem_loading_index + 1) % 8)];
-        // Load B into shared memory
-        sharedB[shared_mem_loading_index + 8 * 8 * i] = B[(i * 8) + (shared_mem_loading_index / 8) * N + (shared_mem_loading_index % 8)];
-        sharedB[shared_mem_loading_index + 8 * 8 * i + 1] = B[(i * 8) + ((shared_mem_loading_index + 1) / 8) * N + ((shared_mem_loading_index + 1) % 8)];
-    }
-
-    // K loop
-    for (uint k = 0; k < K; k+=8) {
-        threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
-
-        // Load sources into simdgroup matricies
-        #pragma unroll(4)
-        for (int i = 0; i < 4; ++i) {
-            simdgroup_load(simdA[i], sharedA + 8 * 8 * i, 8); // K is row width, loop down
-            simdgroup_load(simdB[i], sharedB + 8 * 8 * i, 8); // N is row width, loop right
-        }
-
-        // Load sources into shared memory
-        if (k < K - 8) {
-            A += 8;
-            B += 8 * N;
-            #pragma unroll(4)
-            for (int i = 0; i < 4; ++i) {
-                // Load A into shared memory
-                uint shared_mem_loading_index = local_simdgroup_pos * 2;
-                sharedA[shared_mem_loading_index + 8 * 8 * i] = A[(i * 8 * K) + (shared_mem_loading_index / 8) * K + (shared_mem_loading_index % 8)];
-                sharedA[shared_mem_loading_index + 8 * 8 * i + 1] = A[(i * 8 * K) + ((shared_mem_loading_index + 1) / 8) * K + ((shared_mem_loading_index + 1) % 8)];
-                // Load B into shared memory
-                sharedB[shared_mem_loading_index + 8 * 8 * i] = B[(i * 8) + (shared_mem_loading_index / 8) * N + (shared_mem_loading_index % 8)];
-                sharedB[shared_mem_loading_index + 8 * 8 * i + 1] = B[(i * 8) + ((shared_mem_loading_index + 1) / 8) * N + ((shared_mem_loading_index + 1) % 8)];
-            }
-        }
-
-        // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
-        #pragma unroll(4)
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll(4)
-            for (int j = 0; j < 4; ++j) {
-                simdgroup_multiply_accumulate(acc[i][j], simdA[j], simdB[i], acc[i][j]);
-            }
-        }
-    }
-
-    // Save results
-    #pragma unroll(4)
-    for (int i = 0; i < 4; ++i) {
-        #pragma unroll(4)
-        for (int j = 0; j < 4; ++j) {
-            simdgroup_store(acc[j][i], C + (i * 8 * N) + (j * 8), N);
-        }
-    }
-}
-";
