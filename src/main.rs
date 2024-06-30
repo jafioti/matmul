@@ -13,7 +13,7 @@ const M: u64 = 4096;
 const N: u64 = 4096;
 const K: u64 = 4096;
 
-const TRIALS: usize = 5;
+const TRIALS: usize = 1;
 
 fn main() {
     autoreleasepool(|| {
@@ -94,6 +94,19 @@ fn main() {
             "SIMD: {} ms",
             time_kernel(
                 SIMD,
+                (N / 32, N / 256, 1),
+                (32, 8, 1),
+                &a_buf,
+                &b_buf,
+                &c,
+                &[],
+                0
+            )
+        );
+        println!(
+            "SIMD 2: {} ms",
+            time_kernel(
+                SIMD_2,
                 (N / 32, N / 256, 1),
                 (32, 8, 1),
                 &a_buf,
@@ -187,7 +200,7 @@ fn run_kernel(
     command_buffer.wait_until_completed();
 }
 
-// Super straightforward matmul
+/// Super straightforward matmul
 const NAIVE: &str = "
 #include <metal_stdlib>
 using namespace metal;
@@ -214,7 +227,8 @@ kernel void matmul(
 }
 ";
 
-// Access memory such that each warp accesses contiguous memory (each warp writes to a row in C)
+/// Access memory such that each warp accesses contiguous memory
+/// Each warp writes to a row in C
 const WARP_COALESCED: &str = "
 #include <metal_stdlib>
 using namespace metal;
@@ -243,7 +257,7 @@ kernel void matmul(
 }
 ";
 
-// Load tiles of memory into shared memory to reduce access latency in inner loop
+/// Load tiles of memory into shared memory to reduce access latency in inner loop
 const SMEM_TILED: &str = "
 #include <metal_stdlib>
 using namespace metal;
@@ -299,6 +313,7 @@ kernel void matmul(
 }
 ";
 
+/// Output a 1D vector of TM elements per thread
 const REGISTER_1D_TILE: &str = "
 #include <metal_stdlib>
 using namespace metal;
@@ -363,12 +378,13 @@ kernel void matmul(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (int i = 0; i < BK; ++i) {
+    for (int i = 0; i < TM; ++i) {
         C[(thread_row * TM + i) * N + thread_col] = tmp[i];
     }
 }
 ";
 
+/// Output a 2D matrix of TMxTN elements per thread
 const REGISTER_2D_TILE: &str = "
 #include <metal_stdlib>
 using namespace metal;
@@ -469,6 +485,9 @@ kernel void matmul(
 }
 ";
 
+/// We load a vector of 4 8x8 input matricies for each input.
+/// Accumulate into a 4x4 matrix of 8x8 accumulators.
+/// This utilizes metal's special simdgroup_multiply_accumulate hardware.
 const SIMD: &str = "
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -486,10 +505,11 @@ kernel void matmul(
     device uint& K [[buffer(4)]],
     device uint& N [[buffer(5)]],
     uint3 block_pos [[threadgroup_position_in_grid]],
+    uint3 block_size [[threads_per_threadgroup]],
     uint3 global_pos [[thread_position_in_grid]]
 ) {
     // Step pointers
-    A += block_pos.x * 32 * K;
+    A += block_pos.x * block_size.x * K;
     B += global_pos.y * 32;
     C += block_pos.x * 32 * N + global_pos.y * 32;
 
@@ -514,11 +534,11 @@ kernel void matmul(
         // Load sources into simdgroup matricies
         #pragma unroll(4)
         for (int i = 0; i < 4; ++i) {
-            simdgroup_load(simdA[i], A + k + i * K * 8, K);
-            simdgroup_load(simdB[i], B + k * N + i * 8, N);
+            simdgroup_load(simdA[i], A + (i * 8 * K) + k, K); // K is row width, loop down
+            simdgroup_load(simdB[i], B + (k * N) + (i * 8), N); // N is row width, loop right
         }
 
-        // Do matmul
+        // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
         #pragma unroll(4)
         for (int i = 0; i < 4; ++i) {
             #pragma unroll(4)
@@ -533,7 +553,85 @@ kernel void matmul(
     for (int i = 0; i < 4; ++i) {
         #pragma unroll(4)
         for (int j = 0; j < 4; ++j) {
-            simdgroup_store(acc[j][i], C + j * 8 + i * N * 8, N);
+            simdgroup_store(acc[j][i], C + (i * 8 * N) + (j * 8), N);
+        }
+    }
+}
+";
+
+/// We do the same thing as SIMD but instead use a matrix of 4x4 input matricies, rather than a vector of input matricies
+const SIMD_2: &str = "
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+#include <metal_simdgroup>
+using namespace metal;
+
+kernel void matmul(
+    device const float *A [[buffer(0)]],
+    device const float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    device uint& M [[buffer(3)]],
+    device uint& K [[buffer(4)]],
+    device uint& N [[buffer(5)]],
+    uint3 block_pos [[threadgroup_position_in_grid]],
+    uint3 block_size [[threads_per_threadgroup]],
+    uint3 global_pos [[thread_position_in_grid]]
+) {
+    // Step pointers
+    A += block_pos.x * block_size.x * K;
+    B += global_pos.y * 32;
+    C += block_pos.x * 32 * N + global_pos.y * 32;
+
+    // Initialize accumulating simdgroup matricies
+    simdgroup_float8x8 acc[4][4];
+    #pragma unroll(4)
+    for (uint i = 0; i < 4; ++i) {
+        #pragma unroll(4)
+        for (uint j = 0; j < 4; ++j) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+
+    // Initialize simdgroup source matricies
+    simdgroup_float8x8 simdA[4][4];
+    simdgroup_float8x8 simdB[4][4];
+
+    // K loop
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
+
+        // Load sources into simdgroup matricies
+        #pragma unroll(4)
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll(4)
+            for (int j = 0; j < 4; ++j) {
+                simdgroup_load(simdA[i][j], A + (i * 8 * K) + k + j * 8, K); // K is row width, loop down
+                simdgroup_load(simdB[j][i], B + ((k + j * 8) * N) + (i * 8), N); // N is row width, loop right
+            }
+        }
+
+        // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
+        #pragma unroll(4)
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll(4)
+            for (int j = 0; j < 4; ++j) {
+                #pragma unroll(4)
+                for (int x = 0; x < 4; ++x) {
+                    simdgroup_multiply_accumulate(acc[i][j], simdA[j][x], simdB[x][i], acc[i][j]);
+                }
+            }
+        }
+    }
+
+    // Save results
+    #pragma unroll(4)
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll(4)
+        for (int j = 0; j < 4; ++j) {
+            simdgroup_store(acc[j][i], C + (i * 8 * N) + (j * 8), N);
         }
     }
 }
