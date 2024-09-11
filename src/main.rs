@@ -155,6 +155,19 @@ fn main() {
                 0
             )
         );
+        println!(
+            "SIMD Length 2: {} ms",
+            time_kernel(
+                include_str!("kernels/10_simd_2.metal"),
+                (N / (8 * 8), N / (64 * 8), 1),
+                (32, 8, 1),
+                &a_buf,
+                &b_buf,
+                &c,
+                &[],
+                0
+            )
+        );
     })
 }
 
