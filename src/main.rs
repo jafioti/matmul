@@ -1,5 +1,6 @@
 use std::mem::size_of;
 
+use colored::Colorize;
 use metal::{
     objc::rc::autoreleasepool, Buffer, CommandQueue, ComputePassDescriptor, ComputePipelineState,
     Device, MTLResourceOptions, MTLSize,
@@ -25,165 +26,144 @@ fn main() {
         let a_buf = utils::new_buffer(&a, &device);
         let b_buf = utils::new_buffer(&b, &device);
 
-        println!(
-            "Naive: {} ms",
-            time_kernel(
-                include_str!("kernels/0_naive.metal"),
-                (M / 32, N / 32, 1),
-                (32, 32, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[],
-                0
-            )
+        time_kernel(
+            "Naive",
+            include_str!("kernels/0_naive.metal"),
+            (M / 32, N / 32, 1),
+            (32, 32, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
         );
-        println!(
-            "Warp Coalesced: {} ms",
-            time_kernel(
-                include_str!("kernels/1_warp_coalesced.metal"),
-                (M / 32, N / 32, 1),
-                (32 * 32, 1, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[32],
-                0
-            )
+        time_kernel(
+            "Warp Coalesced",
+            include_str!("kernels/1_warp_coalesced.metal"),
+            (M / 32, N / 32, 1),
+            (32 * 32, 1, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [32],
+            0,
         );
-        println!(
-            "SMEM Tiled: {} ms",
-            time_kernel(
-                include_str!("kernels/2_smem_tiled.metal"),
-                (M / 32, N / 32, 1),
-                (32 * 32, 1, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[32],
-                32 * 32 * 2 * size_of::<f32>() as u64
-            )
+        time_kernel(
+            "SMEM Tiled",
+            include_str!("kernels/2_smem_tiled.metal"),
+            (M / 32, N / 32, 1),
+            (32 * 32, 1, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [32],
+            32 * 32 * 2 * size_of::<f32>() as u64,
         );
-        println!(
-            "1D Register Tiled: {} ms",
-            time_kernel(
-                include_str!("kernels/3_1D_register_tile.metal"),
-                (N / 64, M / 64, 1),
-                ((64 * 64) / 8, 1, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[64, 64, 8],
-                ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64
-            )
+        time_kernel(
+            "1D Register Tiled",
+            include_str!("kernels/3_1D_register_tile.metal"),
+            (N / 64, M / 64, 1),
+            ((64 * 64) / 8, 1, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [64, 64, 8],
+            ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64,
         );
-        println!(
-            "2D Register Tiled: {} ms",
-            time_kernel(
-                include_str!("kernels/4_2D_register_tile.metal"),
-                (N / 64, M / 64, 1),
-                ((64 * 64) / (8 * 8), 1, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[64, 64, 8],
-                ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64
-            )
+        time_kernel(
+            "2D Register Tiled",
+            include_str!("kernels/4_2D_register_tile.metal"),
+            (N / 64, M / 64, 1),
+            ((64 * 64) / (8 * 8), 1, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [64, 64, 8],
+            ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64,
         );
-        println!(
-            "SIMD: {} ms",
-            time_kernel(
-                include_str!("kernels/5_simd.metal"),
-                (N / 32, N / 256, 1),
-                (32, 8, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[],
-                0
-            )
+        time_kernel(
+            "SIMD",
+            include_str!("kernels/5_simd.metal"),
+            (N / 32, N / 256, 1),
+            (32, 8, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
         );
-        println!(
-            "2D SIMD: {} ms",
-            time_kernel(
-                include_str!("kernels/6_2D_simd.metal"),
-                (N / 32, N / 256, 1),
-                (32, 8, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[],
-                0
-            )
+        time_kernel(
+            "2D SIMD",
+            include_str!("kernels/6_2D_simd.metal"),
+            (N / 32, N / 256, 1),
+            (32, 8, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
         );
-        println!(
-            "SIMD Prefetch: {} ms",
-            time_kernel(
-                include_str!("kernels/7_simd_prefetch.metal"),
-                (N / 32, N / 256, 1),
-                (32, 8, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[],
-                8 * 8 * 4 * 2 * 8 * 4 // height x width x num tiles x 2 inputs x 8 simdgroups per threadgroup
-            )
+        time_kernel(
+            "SIMD Prefetch",
+            include_str!("kernels/7_simd_prefetch.metal"),
+            (N / 32, N / 256, 1),
+            (32, 8, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            8 * 8 * 4 * 2 * 8 * 4, // height x width x num tiles x 2 inputs x 8 simdgroups per threadgroup
         );
-        println!(
-            "MLX: {} ms",
-            time_kernel(
-                include_str!("kernels/8_mlx.metal"),
-                (N / 32, M / 32, 1),
-                (32, 2, 2),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[0, 0, 0, 0],
-                0,
-            )
+        time_kernel(
+            "MLX",
+            include_str!("kernels/8_mlx.metal"),
+            (N / 32, M / 32, 1),
+            (32, 2, 2),
+            &a_buf,
+            &b_buf,
+            &c,
+            [0, 0, 0, 0],
+            0,
         );
-        println!(
-            "Simple SIMD: {} ms",
-            time_kernel(
-                include_str!("kernels/9_simd_single.metal"),
-                (N / 8, N / 64, 1),
-                (32, 8, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[],
-                0
-            )
+        time_kernel(
+            "Simple SIMD",
+            include_str!("kernels/9_simd_single.metal"),
+            (N / 8, N / 64, 1),
+            (32, 8, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
         );
-        println!(
-            "SIMD Length 2: {} ms",
-            time_kernel(
-                include_str!("kernels/10_simd_2.metal"),
-                (N / (8 * 8), N / (64 * 8), 1),
-                (32, 8, 1),
-                &a_buf,
-                &b_buf,
-                &c,
-                &[],
-                0
-            )
+        time_kernel(
+            "SIMD Length 2",
+            include_str!("kernels/10_simd_2.metal"),
+            (N / (8 * 8), N / (64 * 8), 1),
+            (32, 8, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
         );
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn time_kernel(
-    kernel: &str,
+fn time_kernel<const A: usize>(
+    name: &str,
+    kernel: impl ToString,
     grid_size: (u64, u64, u64),
     block_size: (u64, u64, u64),
     a_buf: &Buffer,
     b_buf: &Buffer,
     c: &[f32],
-    other_inps: &[u32],
+    other_inps: [u32; A],
     shared_mem: u64,
-) -> u128 {
+) {
     let device = Device::system_default().unwrap();
-    let kernel = utils::compile_function("matmul", kernel, &device);
+    let kernel = utils::compile_function("matmul", &kernel.to_string(), &device);
     let command_queue = device.new_command_queue();
     let c_buffer = device.new_buffer(M * N * 4, MTLResourceOptions::StorageModeShared);
     let start = std::time::Instant::now();
@@ -212,11 +192,15 @@ fn time_kernel(
             println!("{a} ne {b}");
         }
     }
-    total_time / 1_000
+    println!(
+        "{0:.<20} {1}",
+        name,
+        format!("{} ms", total_time / 1_000).bold()
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_kernel(
+fn run_kernel<const A: usize>(
     queue: &CommandQueue,
     kernel: &ComputePipelineState,
     a_buf: &Buffer,
@@ -224,7 +208,7 @@ fn run_kernel(
     c_buf: &Buffer,
     grid_size: (u64, u64, u64),
     block_size: (u64, u64, u64),
-    other_inps: &[u32],
+    other_inps: [u32; A],
     shared_mem: u64,
 ) {
     let command_buffer = queue.new_command_buffer();
