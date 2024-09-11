@@ -17,7 +17,7 @@ kernel void matmul(
     uint3 global_pos [[thread_position_in_grid]]
 ) {
     // Step pointers
-    A += block_pos.x * block_size.x * K;
+    A += block_pos.x * 32 * K;
     B += global_pos.y * 32;
     C += block_pos.x * 32 * N + global_pos.y * 32;
 

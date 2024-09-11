@@ -13,7 +13,7 @@ const M: u64 = 4096;
 const N: u64 = 4096;
 const K: u64 = 4096;
 
-const TRIALS: usize = 5;
+const TRIALS: usize = 1;
 
 fn main() {
     autoreleasepool(|| {
@@ -140,6 +140,19 @@ fn main() {
                 &c,
                 &[0, 0, 0, 0],
                 0,
+            )
+        );
+        println!(
+            "Simple SIMD: {} ms",
+            time_kernel(
+                include_str!("kernels/9_simd_single.metal"),
+                (N / 8, N / 64, 1),
+                (32, 8, 1),
+                &a_buf,
+                &b_buf,
+                &c,
+                &[],
+                0
             )
         );
     })
