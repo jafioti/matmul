@@ -82,7 +82,7 @@ fn main() {
             ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64,
         );
         time_kernel(
-            "SIMD",
+            "1D-tiled SIMD length 4",
             include_str!("kernels/5_simd.metal"),
             (N / 32, N / 256, 1),
             (32, 8, 1),
@@ -93,7 +93,7 @@ fn main() {
             0,
         );
         time_kernel(
-            "2D SIMD",
+            "2D-tiled SIMD",
             include_str!("kernels/6_2D_simd.metal"),
             (N / 32, N / 256, 1),
             (32, 8, 1),
@@ -137,7 +137,7 @@ fn main() {
             0,
         );
         time_kernel(
-            "SIMD Length 2",
+            "1D-tiled SIMD Length 2",
             include_str!("kernels/10_simd_2.metal"),
             (N / (8 * 8), N / (64 * 8), 1),
             (32, 8, 1),
