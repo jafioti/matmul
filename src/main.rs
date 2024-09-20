@@ -1,9 +1,9 @@
-use std::mem::size_of;
+use std::{ffi::c_void, mem::size_of};
 
 use colored::Colorize;
 use metal::{
     objc::rc::autoreleasepool, Buffer, CommandQueue, ComputePassDescriptor, ComputePipelineState,
-    Device, MTLResourceOptions, MTLSize,
+    Device, FunctionConstantValues, MTLDataType, MTLResourceOptions, MTLSize,
 };
 use rand::Rng;
 
@@ -36,6 +36,7 @@ fn main() {
             &c,
             [],
             0,
+            true,
         );
         time_kernel(
             "Warp Coalesced",
@@ -47,6 +48,7 @@ fn main() {
             &c,
             [32],
             0,
+            true,
         );
         time_kernel(
             "SMEM Tiled",
@@ -58,6 +60,7 @@ fn main() {
             &c,
             [32],
             32 * 32 * 2 * size_of::<f32>() as u64,
+            true,
         );
         time_kernel(
             "1D Register Tiled",
@@ -69,6 +72,7 @@ fn main() {
             &c,
             [64, 64, 8],
             ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64,
+            true,
         );
         time_kernel(
             "2D Register Tiled",
@@ -80,6 +84,7 @@ fn main() {
             &c,
             [64, 64, 8],
             ((64 * 8) + (8 * 64)) * size_of::<f32>() as u64,
+            true,
         );
         time_kernel(
             "1D-tiled SIMD length 4",
@@ -91,6 +96,7 @@ fn main() {
             &c,
             [],
             0,
+            true,
         );
         time_kernel(
             "2D-tiled SIMD",
@@ -102,6 +108,7 @@ fn main() {
             &c,
             [],
             0,
+            true,
         );
         time_kernel(
             "SIMD Prefetch",
@@ -113,6 +120,7 @@ fn main() {
             &c,
             [],
             8 * 8 * 4 * 2 * 8 * 4, // height x width x num tiles x 2 inputs x 8 simdgroups per threadgroup
+            true,
         );
         time_kernel(
             "MLX",
@@ -124,6 +132,7 @@ fn main() {
             &c,
             [0, 0, 0, 0],
             0,
+            true,
         );
         time_kernel(
             "Simple SIMD",
@@ -135,6 +144,7 @@ fn main() {
             &c,
             [],
             0,
+            true,
         );
         time_kernel(
             "1D-tiled SIMD Length 2",
@@ -146,6 +156,7 @@ fn main() {
             &c,
             [],
             0,
+            true,
         );
     })
 }
@@ -161,9 +172,31 @@ fn time_kernel<const A: usize>(
     c: &[f32],
     other_inps: [u32; A],
     shared_mem: u64,
+    use_constants: bool,
 ) {
     let device = Device::system_default().unwrap();
-    let kernel = utils::compile_function("matmul", &kernel.to_string(), &device);
+    let constants = if use_constants {
+        let constants = FunctionConstantValues::new();
+        constants.set_constant_value_at_index(
+            &(M as u32) as *const u32 as *const c_void,
+            MTLDataType::UInt,
+            0,
+        );
+        constants.set_constant_value_at_index(
+            &(K as u32) as *const u32 as *const c_void,
+            MTLDataType::UInt,
+            1,
+        );
+        constants.set_constant_value_at_index(
+            &(N as u32) as *const u32 as *const c_void,
+            MTLDataType::UInt,
+            2,
+        );
+        Some(constants)
+    } else {
+        None
+    };
+    let kernel = utils::compile_function("matmul", &kernel.to_string(), &device, constants);
     let command_queue = device.new_command_queue();
     let c_buffer = device.new_buffer(M * N * 4, MTLResourceOptions::StorageModeShared);
     let start = std::time::Instant::now();
@@ -178,6 +211,7 @@ fn time_kernel<const A: usize>(
             block_size,
             other_inps,
             shared_mem,
+            use_constants,
         );
     }
     let total_time = start.elapsed().as_micros() / TRIALS as u128;
@@ -189,7 +223,7 @@ fn time_kernel<const A: usize>(
 
     for (a, b) in c.iter().zip(c_readback_data.iter()) {
         if (*a - *b).abs() > 1e-3 {
-            println!("{a} ne {b}");
+            panic!("{a} ne {b}");
         }
     }
     println!(
@@ -210,6 +244,7 @@ fn run_kernel<const A: usize>(
     block_size: (u64, u64, u64),
     other_inps: [u32; A],
     shared_mem: u64,
+    use_constants: bool,
 ) {
     let command_buffer = queue.new_command_buffer();
     let encoder =
@@ -218,11 +253,13 @@ fn run_kernel<const A: usize>(
     encoder.set_buffer(0, Some(a_buf), 0);
     encoder.set_buffer(1, Some(b_buf), 0);
     encoder.set_buffer(2, Some(c_buf), 0);
-    encoder.set_u32(3, M as u32);
-    encoder.set_u32(4, K as u32);
-    encoder.set_u32(5, N as u32);
+    if !use_constants {
+        encoder.set_u32(3, M as u32);
+        encoder.set_u32(4, K as u32);
+        encoder.set_u32(5, N as u32);
+    }
     for (i, inp) in other_inps.iter().enumerate() {
-        encoder.set_u32(6 + i, *inp);
+        encoder.set_u32(if use_constants { 3 } else { 6 } + i, *inp);
     }
     encoder.set_threadgroup_memory_length(0, shared_mem);
 

@@ -7,13 +7,14 @@
 #include <metal_simdgroup>
 using namespace metal;
 
+constant uint M[[function_constant(0)]];
+constant uint K[[function_constant(1)]];
+constant uint N[[function_constant(2)]];
+
 kernel void matmul(
     device const float *A [[buffer(0)]],
     device const float *B [[buffer(1)]],
     device float *C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
     uint3 block_pos [[threadgroup_position_in_grid]],
     uint3 block_size [[threads_per_threadgroup]],
     uint3 global_pos [[thread_position_in_grid]]

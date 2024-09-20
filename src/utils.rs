@@ -12,10 +12,11 @@ pub fn select_function_from_lib(
     lib: &Library,
     function: &str,
     device: &Device,
+    constants: Option<FunctionConstantValues>,
 ) -> ComputePipelineState {
     let pipeline_state_descriptor = ComputePipelineDescriptor::new();
     pipeline_state_descriptor
-        .set_compute_function(Some(&lib.get_function(function, None).unwrap()));
+        .set_compute_function(Some(&lib.get_function(function, constants).unwrap()));
     device
         .new_compute_pipeline_state_with_function(
             pipeline_state_descriptor.compute_function().unwrap(),
@@ -32,9 +33,14 @@ pub fn new_buffer(data: &[f32], device: &Device) -> Buffer {
     )
 }
 
-pub fn compile_function(name: &str, code: &str, device: &Device) -> ComputePipelineState {
+pub fn compile_function(
+    name: &str,
+    code: &str,
+    device: &Device,
+    constants: Option<FunctionConstantValues>,
+) -> ComputePipelineState {
     let library = compile_lib(device, code);
-    select_function_from_lib(&library, name, device)
+    select_function_from_lib(&library, name, device, constants)
 }
 
 pub fn cpu_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {

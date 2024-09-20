@@ -3,16 +3,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
+constant uint M[[function_constant(0)]];
+constant uint K[[function_constant(1)]];
+constant uint N[[function_constant(2)]];
+
 kernel void matmul(
     device float* A [[buffer(0)]],
     device float* B [[buffer(1)]],
     device float* C [[buffer(2)]],
-    device uint& M [[buffer(3)]],
-    device uint& K [[buffer(4)]],
-    device uint& N [[buffer(5)]],
-    device uint& BM [[buffer(6)]],
-    device uint& BN [[buffer(7)]],
-    device uint& BK [[buffer(8)]],
+    device uint& BM [[buffer(3)]],
+    device uint& BN [[buffer(4)]],
+    device uint& BK [[buffer(5)]],
     threadgroup float* shared_memory [[threadgroup(0)]],
     uint2 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint2 threadgroup_position_in_grid [[threadgroup_position_in_grid]]

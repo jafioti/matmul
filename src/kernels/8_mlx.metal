@@ -534,17 +534,18 @@ struct GEMMKernel {
   }
 };
 
+constant uint M[[function_constant(0)]];
+constant uint K[[function_constant(1)]];
+constant uint N[[function_constant(2)]];
+
 kernel void matmul(
     const device float *A [[buffer(0)]],
     const device float *B [[buffer(1)]],
     device float *C [[buffer(2)]],
-    const constant uint& M [[buffer(3)]],
-    const constant uint& K [[buffer(4)]],
-    const constant uint& N [[buffer(5)]],
-    const constant uint& batch_stride_a [[buffer(6)]],
-    const constant uint& batch_stride_b [[buffer(7)]],
-    const constant uint& batch_size_b [[buffer(8)]],
-    const constant uint& batch_stride_c [[buffer(9)]],
+    const constant uint& batch_stride_a [[buffer(3)]],
+    const constant uint& batch_stride_b [[buffer(4)]],
+    const constant uint& batch_size_b [[buffer(5)]],
+    const constant uint& batch_stride_c [[buffer(6)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
