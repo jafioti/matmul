@@ -528,16 +528,16 @@ constant uint N[[function_constant(1)]];
 constant uint K[[function_constant(2)]];
 
 // Specify the leading dimensions at PSO creation time.
-constant uint A_leading_dimension[[function_constant(5)]];
-constant uint B_leading_dimension[[function_constant(6)]];
-constant uint C_leading_dimension[[function_constant(7)]];
+constant uint A_leading_dimension[[function_constant(3)]];
+constant uint B_leading_dimension[[function_constant(4)]];
+constant uint C_leading_dimension[[function_constant(5)]];
 
 // Whether to load the previous value of C, and add it to the accumulator.
-constant bool load_previous_C[[function_constant(10)]];
+constant bool load_previous_C[[function_constant(6)]];
 
 // Whether each matrix is transposed.
 constant bool A_trans = false;
-constant bool B_trans = true;
+constant bool B_trans = false;
 
 // Define the memory layout of the matrix block.
 constant ushort M_group = 32;
