@@ -92,6 +92,7 @@ namespace metal {
     struct simdgroup_event {
         METAL_FUNC simdgroup_event() thread {}
 
+		// Device to threadgroup simple copy
         template < typename T >
             METAL_FUNC void async_copy(
                 threadgroup T * dst,
@@ -110,6 +111,7 @@ namespace metal {
                         n_elements);
             }
 
+		// Threadgroup to device simple copy
         template < typename T >
             METAL_FUNC void async_copy(
                 device T * dst,
@@ -128,6 +130,7 @@ namespace metal {
                         n_elements);
             }
 
+		// Device to threadgroup tiled copy
         template < typename T >
             METAL_FUNC void async_copy(
                 // Description of the destination.
@@ -172,6 +175,7 @@ namespace metal {
                         static_cast < int > (clamp_mode));
             }
 
+		// Threadgroup to device tiled copy
         template < typename T >
             METAL_FUNC void async_copy(
                 // Description of the destination.
@@ -214,6 +218,7 @@ namespace metal {
                         0);
             }
 
+		// Wait for a copy to go through?
         METAL_FUNC static void wait(int count, thread simdgroup_event * events) {
             __metal_wait_simdgroup_events(
                 count, reinterpret_cast < thread _simdgroup_event_t ** > (events));
@@ -254,6 +259,7 @@ namespace metal {
 // nodal-point Laplacians, to sorting large lattices of atoms.
 //
 // Source: https://patents.google.com/patent/US11256518B2
+// This function computes the first M(X) and N(Y) coordinates of the matrix for a given thread index in a simdgroup
 METAL_FUNC static ushort2 morton_order(ushort thread_index_in_simdgroup) {
     ushort lane_id = thread_index_in_simdgroup;
     ushort quad_id = lane_id / 4;
@@ -609,39 +615,6 @@ METAL_FUNC void multiply_accumulate(
     }
 }
 
-// One multiply-accumulate loop iteration, or 8 dot products.
-METAL_FUNC void multiply_accumulate(
-    const threadgroup float * A_src,
-        const threadgroup float * B_src,
-            thread simdgroup_matrix_storage < float > * A_sram,
-            thread simdgroup_matrix_storage < float > * B_sram,
-            thread simdgroup_matrix_storage < float > * C_sram,
-            ushort k
-) {
-    #pragma clang loop unroll(full)
-    for (ushort m = 0; m < 16; m += 8) {
-        ushort2 origin(0, m);
-        auto A = get_sram(A_sram, 8, origin);
-        A -> load(A_src, 32, ushort2(k, m), A_trans);
-    }
-    #pragma clang loop unroll(full)
-    for (ushort n = 0; n < 16; n += 8) {
-        ushort2 origin(n, 0);
-        auto B = get_sram(B_sram, 16, origin);
-        B -> load(B_src, 32, ushort2(n, k), B_trans);
-    }
-    #pragma clang loop unroll(full)
-    for (ushort m = 0; m < 16; m += 8) {
-        #pragma clang loop unroll(full)
-        for (ushort n = 0; n < 16; n += 8) {
-            auto A = get_sram(A_sram, 8, ushort2(0, m));
-            auto B = get_sram(B_sram, 16, ushort2(n, 0));
-            auto C = get_sram(C_sram, 16, ushort2(n, m));
-            C -> multiply( * A, * B);
-        }
-    }
-}
-
 // Metal function arguments.
 //
 // A: the left-hand side matrix
@@ -665,14 +638,15 @@ METAL_FUNC void multiply_accumulate(
 // - ideally 10 KB or less
 // - precision: void/8-bit integer to make the pointer arithmetic more legible
 
-kernel void matmul(device float * A[[buffer(0)]],
+kernel void matmul(
+	device float * A[[buffer(0)]],
     device float * B[[buffer(1)]],
     device float * C[[buffer(2)]],
     threadgroup uchar * threadgroup_block[[threadgroup(0)]],
-
     uint3 gid[[threadgroup_position_in_grid]],
     ushort sidx[[simdgroup_index_in_threadgroup]],
-    ushort lane_id[[thread_index_in_simdgroup]]) {
+    ushort lane_id[[thread_index_in_simdgroup]]
+) {
     ushort2 sid(sidx % 2, sidx / 2);
     ushort2 morton_offset = morton_order(lane_id);
 
@@ -684,10 +658,10 @@ kernel void matmul(device float * A[[buffer(0)]],
     // the reason for the early exit.
     uint M_offset = gid.y * M_group;
     uint N_offset = gid.x * N_group;
-    if (M_offset + sid.y * 16 >= M ||
-        N_offset + sid.x * 16 >= N) {
-        return;
-    }
+    // if (M_offset + sid.y * 16 >= M ||
+    //     N_offset + sid.x * 16 >= N) {
+    //     return;
+    // }
     ushort2 offset_in_group(sid.x * 16 + morton_offset.x,
         sid.y * 16 + morton_offset.y);
 
@@ -699,79 +673,20 @@ kernel void matmul(device float * A[[buffer(0)]],
         N_offset -= N_shift;
     }
 
-    simdgroup_matrix_storage < float > C_sram[
-        4];
-
-    if (load_previous_C) {
-
-        if (false) {
-            // Fast path for matrices that qualify.
-            uint2 C_offset(N_offset + offset_in_group.x,
-                M_offset + offset_in_group.y);
-            auto C_dst = simdgroup_matrix_storage < float > ::apply_offset(
-                C, C_leading_dimension, C_offset);
-
-            // Write the accumulator to device memory.
-            #pragma clang loop unroll(full)
-            for (ushort m = 0; m < 16; m += 8) {
-                #pragma clang loop unroll(full)
-                for (ushort n = 0; n < 16; n += 8) {
-                    ushort2 origin(n, m);
-                    auto C = get_sram(C_sram, 16, origin);
-                    C -> load(C_dst, C_leading_dimension, origin);
-                }
-            }
-        } else {
-            // Slow path for when memory must be handled more carefully.
-            auto C_block = (threadgroup float * )(threadgroup_block);
-            auto C_block_dst =
-                simdgroup_matrix_storage < float > ::apply_offset(
-                    C_block, 32, offset_in_group);
-
-            // Launch the async copy from threadgroup to device memory.
-            if (sidx == 0) {
-                uint2 C_offset(N_offset, M_offset);
-                ushort2 C_tile(min(uint(N_group), N - C_offset.x),
-                    min(uint(M_group), M - C_offset.y));
-                auto C_dst = simdgroup_matrix_storage < float > ::apply_offset(
-                    C, C_leading_dimension, C_offset);
-
-                simdgroup_event event;
-                event.async_copy(
-                    C_block, 32, C_tile,
-                    C_dst, C_leading_dimension, C_tile);
-                simdgroup_event::wait(1, & event);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Read the accumulator from threadgroup memory.
-            #pragma clang loop unroll(full)
-            for (ushort m = 0; m < 16; m += 8) {
-                #pragma clang loop unroll(full)
-                for (ushort n = 0; n < 16; n += 8) {
-                    ushort2 origin(n, m);
-                    auto C = get_sram(C_sram, 16, origin);
-                    C -> load(
-                        C_block_dst, 32, origin);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-    } else {
+    // Init accumulators
+    simdgroup_matrix_storage < float > C_sram[4];
+    #pragma clang loop unroll(full)
+    for (ushort m = 0; m < 16; m += 8) {
         #pragma clang loop unroll(full)
-        for (ushort m = 0; m < 16; m += 8) {
-            #pragma clang loop unroll(full)
-            for (ushort n = 0; n < 16; n += 8) {
-                ushort2 origin(n, m);
-                auto C = get_sram(C_sram, 16, origin);
-                * C = simdgroup_matrix_storage < float > (0);
-            }
+        for (ushort n = 0; n < 16; n += 8) {
+            ushort2 origin(n, m);
+            auto C = get_sram(C_sram, 16, origin);
+            * C = simdgroup_matrix_storage < float > (0);
         }
     }
 
     // Perform the iterations where async copy is avoided.
-    for (uint k = 0; k < 0; k += 8) {
+    for (uint k = 0; k < (K - (K % K_group)); k += 8) {
         uint2 A_offset(k, M_offset);
         uint2 B_offset(N_offset, k);
         A_offset += uint2(morton_offset.x, offset_in_group.y);
@@ -790,138 +705,20 @@ kernel void matmul(device float * A[[buffer(0)]],
             A_sram, B_sram, C_sram, 0);
     }
 
-    // Perform the iterations where async copy is used.
-    for (uint k = 0; k < K; k += K_group) {
-        auto A_block = (threadgroup float * )(
-            threadgroup_block);
-        auto B_block = (threadgroup float * )(
-            threadgroup_block + 4096);
+    // Fast path for matrices that qualify.
+    uint2 C_offset(N_offset + offset_in_group.x,
+        M_offset + offset_in_group.y);
+    auto C_dst = simdgroup_matrix_storage < float > ::apply_offset(
+        C, C_leading_dimension, C_offset);
 
-        // Launch an async copy from device to threadgroup memory.
-        if (sidx == 0) {
-            uint2 A_offset(k, M_offset);
-            uint2 B_offset(N_offset, k);
-            auto A_src = simdgroup_matrix_storage < float > ::apply_offset(
-                A, A_leading_dimension, A_offset, A_trans);
-            auto B_src = simdgroup_matrix_storage < float > ::apply_offset(
-                B, B_leading_dimension, B_offset, B_trans);
-
-            ushort M_tile_dimension = min(uint(M_group), M - M_offset);
-            ushort N_tile_dimension = min(uint(N_group), N - N_offset);
-            ushort K_tile_dimension = min(uint(K_group), K - k);
-            ushort K_tile_padded = min(uint(K_group), (K + K_remainder_padded - K_remainder) - k);
-
-            ushort2 A_tile_src(K_tile_dimension, M_tile_dimension);
-            ushort2 B_tile_src(N_tile_dimension, K_tile_dimension);
-            ushort2 A_tile_dst(K_tile_padded, M_tile_dimension);
-            ushort2 B_tile_dst(N_tile_dimension, K_tile_padded);
-
-            simdgroup_event events[2];
-            events[0].async_copy(
-                A_block, 32, A_tile_dst,
-                A_src, A_leading_dimension, A_tile_src, A_trans);
-            events[1].async_copy(
-                B_block, 32, B_tile_dst,
-                B_src, B_leading_dimension, B_tile_src, B_trans);
-            simdgroup_event::wait(2, events);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        ushort2 A_block_offset(morton_offset.x, offset_in_group.y);
-        ushort2 B_block_offset(offset_in_group.x, morton_offset.y);
-        auto A_block_src = A_block;
-        auto B_block_src = B_block;
-        A_block_src = simdgroup_matrix_storage < float > ::apply_offset(
-            A_block_src, 32, A_block_offset, A_trans);
-        B_block_src = simdgroup_matrix_storage < float > ::apply_offset(
-            B_block_src, 32, B_block_offset, B_trans);
-
-        simdgroup_matrix_storage < float > A_sram[
-            2 * (K_group / 8)];
-        simdgroup_matrix_storage < float > B_sram[
-            (K_group / 8) * 2];
+    // Write the accumulator to device memory.
+    #pragma clang loop unroll(full)
+    for (ushort m = 0; m < 16; m += 8) {
         #pragma clang loop unroll(full)
-        for (ushort k = 0; k < K_remainder_padded; k += 8) {
-            multiply_accumulate(A_block_src, B_block_src,
-                A_sram, B_sram, C_sram, k);
-        }
-
-        // Will there be any iterations after this one?
-        if (k + K_group < K) {
-            // If so, we haven't reached the edge of either input matrix yet.
-            #pragma clang loop unroll(full)
-            for (ushort k = K_remainder_padded; k < K_group; k += 8) {
-                multiply_accumulate(A_block_src, B_block_src,
-                    A_sram, B_sram, C_sram, k);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    if (false) {
-        // Fast path for matrices that qualify.
-        uint2 C_offset(N_offset + offset_in_group.x,
-            M_offset + offset_in_group.y);
-        auto C_dst = simdgroup_matrix_storage < float > ::apply_offset(
-            C, C_leading_dimension, C_offset);
-
-        // Write the accumulator to device memory.
-        #pragma clang loop unroll(full)
-        for (ushort m = 0; m < 16; m += 8) {
-            #pragma clang loop unroll(full)
-            for (ushort n = 0; n < 16; n += 8) {
-                ushort2 origin(n, m);
-                auto C = get_sram(C_sram, 16, origin);
-                C -> store(C_dst, C_leading_dimension, origin);
-            }
-        }
-    } else {
-        // Slow path for when memory must be handled more carefully.
-        auto C_block = (threadgroup float * )(threadgroup_block);
-        auto C_block_dst =
-            simdgroup_matrix_storage < float > ::apply_offset(
-                C_block, 32, offset_in_group);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Write the accumulator to threadgroup memory.
-        #pragma clang loop unroll(full)
-        for (ushort m = 0; m < 16; m += 8) {
-            #pragma clang loop unroll(full)
-            for (ushort n = 0; n < 16; n += 8) {
-                ushort2 origin(n, m);
-                auto C = get_sram(C_sram, 16, origin);
-                C -> store(
-                    C_block_dst, 32, origin);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Launch the async copy from threadgroup to device memory.
-        if (sidx == 0) {
-            uint2 C_offset(gid.x * N_group, gid.y * M_group);
-            ushort2 C_tile(min(uint(N_group), N - C_offset.x),
-                min(uint(M_group), M - C_offset.y));
-            auto C_dst = simdgroup_matrix_storage < float > ::apply_offset(
-                C, C_leading_dimension, C_offset);
-
-            // If we shift successfully, the garbage zone moves from the bottom right
-            // to the top left.
-            if ((M_shift != 0) || (N_shift != 0)) {
-                ushort2 C_block_shift(0, 0);
-                if ((M_shift != 0) && (C_offset.y >= M_edge)) {
-                    C_block_shift.y = M_shift;
-                }
-                if ((N_shift != 0) && (C_offset.x >= N_edge)) {
-                    C_block_shift.x = N_shift;
-                }
-                C_block = simdgroup_matrix_storage < float > ::apply_offset(
-                    C_block, 32, C_block_shift);
-            }
-
-            simdgroup_event event;
-            event.async_copy(
-                C_dst, C_leading_dimension, C_tile,
-                C_block, 32, C_tile);
+        for (ushort n = 0; n < 16; n += 8) {
+            ushort2 origin(n, m);
+            auto C = get_sram(C_sram, 16, origin);
+            C -> store(C_dst, C_leading_dimension, origin);
         }
     }
 }

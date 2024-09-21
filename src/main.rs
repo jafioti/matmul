@@ -162,12 +162,12 @@ fn main() {
             "MFA",
             include_str!("kernels/11_mfa.metal"),
             (N / 32, N / 32, 1),
-            (32, 32, 1),
+            (32 * 2 * 2, 1, 1),
             &a_buf,
             &b_buf,
             &c,
             [],
-            8096,
+            0,
             &[
                 (
                     &(M as u32) as *const u32 as *const c_void,
@@ -244,9 +244,9 @@ fn time_kernel<const A: usize>(
         *d = unsafe { *ptr.add(i) };
     }
 
-    for (a, b) in c.iter().zip(c_readback_data.iter()) {
+    for (i, (a, b)) in c.iter().zip(c_readback_data.iter()).enumerate() {
         if (*a - *b).abs() > 1e-3 {
-            panic!("{a} ne {b}");
+            panic!("{a} ne {b} | Index {i}");
         }
     }
     println!(
