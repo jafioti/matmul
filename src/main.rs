@@ -89,7 +89,19 @@ fn main() {
         time_kernel(
             "1D-tiled SIMD length 4",
             include_str!("kernels/5_simd.metal"),
-            (N / 32, N / 256, 1),
+            (N / 32, N / 32 / 8, 1), // thread dim x runs N times, thread dim y runs N / 32 times
+            (32, 8, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
+            &[],
+        );
+        time_kernel(
+            "1D-tiled SIMD length 4",
+            include_str!("kernels/simd_simple_4x1.metal"),
+            (N / 32, N / 32 / 8, 1), // thread dim x runs N times, thread dim y runs N / 32 times
             (32, 8, 1),
             &a_buf,
             &b_buf,
@@ -183,6 +195,18 @@ fn main() {
                 ),
                 (&false as *const bool as *const c_void, MTLDataType::Bool),
             ],
+        );
+        time_kernel(
+            "SIMD Simple",
+            include_str!("kernels/simd_simple.metal"),
+            (N / 8, N / 8, 1), // thread dim x runs N times, thread dim y runs N / 2 times
+            (8, 4, 1),
+            &a_buf,
+            &b_buf,
+            &c,
+            [],
+            0,
+            &[],
         );
     })
 }

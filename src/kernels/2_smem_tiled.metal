@@ -26,7 +26,7 @@ kernel void matmul(
     B += column * BLOCK_SIZE;
     C += row * BLOCK_SIZE * N + column * BLOCK_SIZE;
 
-    float tmp = 0.0;
+    float tmp[1] = {0.0};
 
     // Setup shared memory pointers
     threadgroup float* As = shared_memory;
@@ -46,10 +46,10 @@ kernel void matmul(
 
         // Do matmul on SMEM block
         for (int i = 0; i < BLOCK_SIZE; ++i) {
-            tmp += As[thread_row * BLOCK_SIZE + i] * Bs[i * BLOCK_SIZE + thread_col];
+            tmp[0] += As[thread_row * BLOCK_SIZE + i] * Bs[i * BLOCK_SIZE + thread_col];
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    C[thread_row * N + thread_col] = tmp;
+    C[thread_row * N + thread_col] = tmp[0];
 }

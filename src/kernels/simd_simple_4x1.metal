@@ -19,25 +19,42 @@ kernel void matmul(
     uint3 block_size [[threads_per_threadgroup]],
     uint3 thread_pos [[thread_position_in_threadgroup]]
 ) {
+    // Step pointers
+    A += block_pos.x * 32 * K;
+    B += (block_pos.y * block_size.y + thread_pos.y) * 32;
+    C += block_pos.x * 32 * N + (block_pos.y * block_size.y + thread_pos.y) * 32;
+
     // Initialize accumulating simdgroup matricies
-    simdgroup_float8x8 acc[16] = {simdgroup_float8x8(0)};
+    simdgroup_float8x8 acc[4][4];
+    #pragma unroll(4)
+    for (uint i = 0; i < 4; ++i) {
+        #pragma unroll(4)
+        for (uint j = 0; j < 4; ++j) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+
+    // Initialize simdgroup source matricies
+    simdgroup_float8x8 simdA[4];
+    simdgroup_float8x8 simdB[4];
 
     // K loop
     for (uint k = 0; k < K; k+=8) {
-        // threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
+        threadgroup_barrier(mem_flags::mem_threadgroup); // For some reason this speeds it up
+
+        // Load sources into simdgroup matricies
+        #pragma unroll(4)
+        for (int i = 0; i < 4; ++i) {
+            simdgroup_load(simdA[i], A + (i * 8 * K) + k, K); // K is row width, loop down
+            simdgroup_load(simdB[i], B + (k * N) + (i * 8), N); // N is row width, loop right
+        }
 
         // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
         #pragma unroll(4)
         for (int i = 0; i < 4; ++i) {
             #pragma unroll(4)
             for (int j = 0; j < 4; ++j) {
-            // simdgroup_float8x8 acc = simdgroup_float8x8(0.0);
-
-	            simdgroup_float8x8 simdA[1];
-	           	simdgroup_load(simdA[0], A + block_pos.x * 32 * K + j * 8 * K + k, K);
-	            simdgroup_float8x8 simdB[1];
-	        	simdgroup_load(simdB[0], B + (block_pos.y * 8 + thread_pos.y) * 32 + (k * N) + (i * 8), N);
-                simdgroup_multiply_accumulate(acc[i * 4 + j], simdA[0], simdB[0], acc[i * 4 + j]);
+                simdgroup_multiply_accumulate(acc[i][j], simdA[j], simdB[i], acc[i][j]);
             }
         }
     }
@@ -47,7 +64,7 @@ kernel void matmul(
     for (int i = 0; i < 4; ++i) {
         #pragma unroll(4)
         for (int j = 0; j < 4; ++j) {
-        	simdgroup_store(acc[i * 4 + j], C + block_pos.x * 32 * N + (block_pos.y * 8 + thread_pos.y) * 32 + (j * 8 * N) + (i * 8), N);
+            simdgroup_store(acc[j][i], C + (i * 8 * N) + (j * 8), N);
         }
     }
 }
