@@ -22,21 +22,21 @@ kernel void matmul(
     uint column = threadgroup_position_in_grid.y;
 
     // Advance pointers to starting points
-    A += row * BLOCK_SIZE * K;
-    B += column * BLOCK_SIZE;
+    A += row * BLOCK_SIZE * K + thread_row * K + thread_col;
+    B += column * BLOCK_SIZE + thread_col + thread_row * N;
     C += row * BLOCK_SIZE * N + column * BLOCK_SIZE;
 
-    float tmp[1] = {0.0};
+    float tmp = 0.0;
 
     // Setup shared memory pointers
-    threadgroup float* As = shared_memory;
-    threadgroup float* Bs = shared_memory + (BLOCK_SIZE * BLOCK_SIZE);
+    threadgroup float* As = shared_memory + thread_row * BLOCK_SIZE;
+    threadgroup float* Bs = shared_memory + (BLOCK_SIZE * BLOCK_SIZE) + thread_col;
 
     // Tile loop
     for (int tileIndex = 0; tileIndex < K; tileIndex += BLOCK_SIZE) {
         // Load tile into shared memory
-        As[thread_row * BLOCK_SIZE + thread_col] = A[thread_row * K + thread_col];
-        Bs[thread_row * BLOCK_SIZE + thread_col] = B[thread_row * N + thread_col];
+        As[thread_col] = *A;
+        Bs[thread_row * BLOCK_SIZE] = *B;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -46,10 +46,10 @@ kernel void matmul(
 
         // Do matmul on SMEM block
         for (int i = 0; i < BLOCK_SIZE; ++i) {
-            tmp[0] += As[thread_row * BLOCK_SIZE + i] * Bs[i * BLOCK_SIZE + thread_col];
+            tmp += As[i] * Bs[i * BLOCK_SIZE];
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    C[thread_row * N + thread_col] = tmp[0];
+    C[thread_row * N + thread_col] = tmp;
 }
