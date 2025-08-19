@@ -199,13 +199,13 @@ fn main() {
         time_kernel(
             "SIMD Simple",
             include_str!("kernels/simd_simple.metal"),
-            (N / 8, N / 8, 1), // thread dim x runs N times, thread dim y runs N / 2 times
-            (8, 4, 1),
+            (N / 8, N / 16, 1), // thread dim x runs N times, thread dim y runs N / 2 times
+            (8, 8, 1),
             &a_buf,
             &b_buf,
             &c,
             [],
-            0,
+            ((8 * 8) + (8 * 8)) * 2 * size_of::<f32>() as u64,
             &[],
         );
     })

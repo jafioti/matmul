@@ -17,8 +17,14 @@ kernel void matmul(
     device float *C [[buffer(2)]],
     uint3 block_pos [[threadgroup_position_in_grid]],
     uint3 block_size [[threads_per_threadgroup]],
-    uint3 thread_pos [[thread_position_in_threadgroup]]
+    uint3 thread_pos [[thread_position_in_threadgroup]],
+    uint3 global_pos [[thread_position_in_grid]]
 ) {
+
+    A += block_pos.x * 8 * K;
+    B += (block_pos.y * 16 + thread_pos.y / 4 * 8);
+    C += block_pos.x * 8 * N + block_pos.y * 16 + thread_pos.y / 4 * 8;
+
     // Initialize accumulating simdgroup matricies
     simdgroup_float8x8 acc = simdgroup_float8x8(0);
 
@@ -28,14 +34,13 @@ kernel void matmul(
 
         // Load sources into simdgroup matricies
         simdgroup_float8x8 simdA;
-        simdgroup_load(simdA, A + block_pos.x * 8 * K + k, K);
+        simdgroup_load(simdA, A + k, K);
         simdgroup_float8x8 simdB;
-        simdgroup_load(simdB, B + block_pos.y * 8 + (k * N), N);
+        simdgroup_load(simdB, B + (k * N), N);
 
-        // Do matmul by looping through the result matricies and multiply-accumulating them with the appropriate input mats
         simdgroup_multiply_accumulate(acc, simdA, simdB, acc);
     }
 
     // Save results
-    simdgroup_store(acc, C + block_pos.x * 8 * N + block_pos.y * 8, N);
+    simdgroup_store(acc, C, N);
 }
